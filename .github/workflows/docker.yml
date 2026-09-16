@@ -1,16 +1,18 @@
 name: docker
 
 # 构建多架构镜像并推送到 GHCR：
-#   ghcr.io/<owner>/proxy-checker:latest     （默认分支）
-#   ghcr.io/<owner>/proxy-checker:v6.3       （打 tag 时）
+#   ghcr.io/<owner>/proxy-checker:<tag>      （推送 v* tag 时，例如 v6.5）
+#   ghcr.io/<owner>/proxy-checker:latest     （打 tag 或手动触发时，指向最近一次构建）
 #   ghcr.io/<owner>/proxy-checker:sha-xxxxxxx
+#
+# 触发方式：只由 v* tag 推送或手动 workflow_dispatch 触发，不监听分支推送。
+# 这样一次发布只产生一个 run，latest 与 sha-* 不会被多个 run 争写。
 #
 # 首次推送后，需要在 GitHub 仓库的 Packages 页面把镜像设为 Public，
 # 否则服务器上拉取镜像需要先 docker login ghcr.io。
 
 on:
   push:
-    branches: ["main"]
     tags: ["v*"]
   workflow_dispatch:
 

@@ -19,6 +19,10 @@ DEFAULT_GEMINI_TARGET = "https://gemini.google.com/"
 DEFAULT_GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_CLAUDE_TARGET = "https://claude.ai/"
 DEFAULT_CLAUDE_API = "https://api.anthropic.com/v1/models"
+# Z.AI（智谱国际版）。实测：https://z.ai/ 会 302 到 https://chat.z.ai/，
+# 边缘是阿里云 ESA（响应头 server: ESA，没有 cf-ray），API 域名未带鉴权时返回 401 + code 1001。
+DEFAULT_ZAI_TARGET = "https://z.ai/"
+DEFAULT_ZAI_API = "https://api.z.ai/api/paas/v4/models"
 DEFAULT_IP_TARGETS = ("https://httpbin.org/ip", "https://api.ipify.org?format=json")
 DEFAULT_IP_INFO_TARGETS = ("https://ipinfo.io/{ip}/json", "https://ipwho.is/{ip}")
 
@@ -48,6 +52,9 @@ OPENAI_REAL_PAGE_INDICATORS = (
     "prompt-textarea",
     "conversation-turn",
 )
+# z.ai 首页特征串（实测：标题 "Z.ai - Advanced AI Chatbot & Agent powered by GLM-5.3-Flash"，
+# 页面内 chatglm 出现 7 次、z.ai 3 次、zhipu 2 次，全部小写即可命中）。
+ZAI_PAGE_INDICATORS = ("z.ai", "chatglm", "zhipu")
 PROTOCOL_PREFIXES = ("http://", "https://", "socks4://", "socks5://", "socks5h://")
 PROTOCOL_FALLBACK_STATUS_CODES = (200, 401, 403)
 DEFAULT_TARGET_PROFILE = "generic"
@@ -70,6 +77,11 @@ class TargetProfile:
     service_ok_statuses: Tuple[int, ...] = SERVICE_OK_STATUS_CODES
     api_ok_statuses: Tuple[int, ...] = API_OK_STATUS_CODES
     use_cf_detection: bool = False
+    # 单轮内服务探针的额外重试次数；0 表示与既有档位一致（不重试）。
+    # 任一尝试判定通过即视为该轮通过，用于抵御边缘节点偶发的挑战页/瞬时错误。
+    service_retries: int = 0
+    # 档位专属的失败提示，追加到 error 文案末尾；仅在「已拿到响应但判定失败」时追加。
+    failure_hint: str = ""
 
 
 TARGET_PROFILES: Dict[str, TargetProfile] = {
@@ -109,6 +121,20 @@ TARGET_PROFILES: Dict[str, TargetProfile] = {
         api_url=DEFAULT_CLAUDE_API,
         service_indicators=("claude", "anthropic", "__next"),
         use_cf_detection=True,
+    ),
+    "zai": TargetProfile(
+        id="zai",
+        name="Z.AI 检测",
+        service_url=DEFAULT_ZAI_TARGET,
+        api_url=DEFAULT_ZAI_API,
+        service_indicators=ZAI_PAGE_INDICATORS,
+        # z.ai 本身不在 Cloudflare 后面（边缘是阿里云 ESA），这里开启 CF 检测是为了识别
+        # 「代理侧注入的挑战页/拦截页」：这类响应状态码常为 200 却无真实内容，
+        # 若关闭检测会被 _apply_service_response 误判为可达。
+        use_cf_detection=True,
+        # 边缘偶发挑战页，单轮内多试一次可明显降低误判率。
+        service_retries=1,
+        failure_hint="z.ai 边缘为阿里云 ESA 且未接 Cloudflare，异常状态码/挑战页多来自代理侧拦截",
     ),
 }
 
@@ -234,7 +260,7 @@ class ProxyCheckEngine:
     ) -> None:
         profile = self._get_profile(target_profile)
         worker_count = max(1, min(max_concurrent, len(proxies))) if proxies else 0
-        proxy_timeout = self._single_proxy_timeout(rounds)
+        proxy_timeout = self._single_proxy_timeout(rounds, profile)
         queue: asyncio.Queue[str] = asyncio.Queue()
         for proxy in proxies:
             queue.put_nowait(proxy)
@@ -280,8 +306,10 @@ class ProxyCheckEngine:
                 tasks = pending
                 await asyncio.sleep(0.25)
 
-    def _single_proxy_timeout(self, rounds: int) -> int:
-        expected_round_budget = rounds * (self.config.timeout + self.config.detect_timeout)
+    def _single_proxy_timeout(self, rounds: int, profile: TargetProfile) -> int:
+        # 单条代理的硬超时必须把档位内的服务探针重试算进去，否则会掐掉合法的重试。
+        attempts = 1 + max(0, profile.service_retries)
+        expected_round_budget = rounds * (self.config.timeout * attempts + self.config.detect_timeout)
         return max(30, min(90, expected_round_budget + 10))
 
     def check_proxy_full(
@@ -372,7 +400,7 @@ class ProxyCheckEngine:
         proxy = {"http": proxy_str, "https": proxy_str}
         request_timeout = timeout if timeout is not None else self.config.timeout
 
-        self._probe_service(result, profile, proxy, request_timeout)
+        self._probe_service(result, profile, proxy, request_timeout, stop_event)
         if profile.api_url:
             self._probe_api(result, profile, proxy, request_timeout)
         if ip_hint:
@@ -398,7 +426,7 @@ class ProxyCheckEngine:
         proxy = {"http": proxy_str, "https": proxy_str}
         request_timeout = timeout if timeout is not None else self.config.timeout
 
-        await self._probe_service_async(session, result, profile, proxy, request_timeout)
+        await self._probe_service_async(session, result, profile, proxy, request_timeout, stop_event)
         checks = []
         if profile.api_url:
             checks.append(self._probe_api_async(session, result, profile, proxy, request_timeout))
@@ -509,6 +537,23 @@ class ProxyCheckEngine:
         profile: TargetProfile,
         proxy: Mapping[str, str],
         timeout: int,
+        stop_event: Optional[StopEvent] = None,
+    ) -> bool:
+        """服务探针：按档位 service_retries 在同一轮内重试，任一尝试通过即视为该轮通过。"""
+        attempts = 1 + max(0, profile.service_retries)
+        for _ in range(attempts):
+            if _is_stopped(stop_event):
+                return False
+            if self._probe_service_once(result, profile, proxy, timeout):
+                return True
+        return False
+
+    def _probe_service_once(
+        self,
+        result: RoundResult,
+        profile: TargetProfile,
+        proxy: Mapping[str, str],
+        timeout: int,
     ) -> bool:
         try:
             start = time.time()
@@ -536,6 +581,24 @@ class ProxyCheckEngine:
             return False
 
     async def _probe_service_async(
+        self,
+        session: cffi_requests.AsyncSession,
+        result: RoundResult,
+        profile: TargetProfile,
+        proxy: Mapping[str, str],
+        timeout: int,
+        stop_event: Optional[StopEvent] = None,
+    ) -> bool:
+        """服务探针（异步）：与同步版一致，同一轮内按 service_retries 重试。"""
+        attempts = 1 + max(0, profile.service_retries)
+        for _ in range(attempts):
+            if _is_stopped(stop_event):
+                return False
+            if await self._probe_service_once_async(session, result, profile, proxy, timeout):
+                return True
+        return False
+
+    async def _probe_service_once_async(
         self,
         session: cffi_requests.AsyncSession,
         result: RoundResult,
@@ -1103,7 +1166,7 @@ def _build_public_result(
         "grade": summary.grade,
         "checks_passed": summary.checks_passed,
         "checks_total": summary.checks_total,
-        "error": _summary_error(summary, result),
+        "error": _apply_failure_hint(_summary_error(summary, result), profile, result),
         "latency": summary.latency,
         "status_code": result.status_code,
         "ip": result.ip,
@@ -1136,7 +1199,7 @@ def _failure_result(original: str, rounds: int, profile: TargetProfile, error: s
         "grade": "F",
         "checks_passed": 0,
         "checks_total": rounds,
-        "error": error,
+        "error": _apply_failure_hint(error, profile),
         "latency": None,
         "status_code": None,
         "ip": None,
@@ -1195,6 +1258,24 @@ def _summary_error(summary: ScoreSummary, result: RoundResult) -> Optional[str]:
         f"API {detail.get('api_passed', 0)}/{summary.checks_total}, "
         f"出口IP {detail.get('base_passed', 0)}/{summary.checks_total})"
     )
+
+
+def _apply_failure_hint(
+    error: Optional[str],
+    profile: TargetProfile,
+    result: Optional[RoundResult] = None,
+) -> Optional[str]:
+    """给失败结果追加档位专属提示。
+
+    只在「已拿到 HTTP 响应但判定不通过」（有状态码，或识别到挑战页）时追加：这类失败才需要
+    解释「该站点的特殊性」。纯网络层失败（超时/连接被拒/协议不通）原因已由 classify_error
+    说清，再附加提示只会变成噪音。
+    """
+    if not error or not profile.failure_hint:
+        return error
+    if result is None or (result.status_code is None and not result.cf_challenge):
+        return error
+    return f"{error}（{profile.failure_hint}）"
 
 
 def _is_stopped(stop_event: Optional[StopEvent]) -> bool:

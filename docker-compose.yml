@@ -13,7 +13,7 @@ services:
       args:
         # 设为 "0" 可去掉 Node.js 让镜像更小，代价是 ProxyNova 源无法解析
         WITH_NODE: "1"
-    image: proxy-checker:6.4
+    image: proxy-checker:6.5
     container_name: proxy-checker
     restart: unless-stopped
 

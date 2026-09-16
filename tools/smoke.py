@@ -8,7 +8,7 @@ import urllib.request
 from typing import Any, Dict
 
 
-EXPECTED_PROFILES = {"generic", "openai", "grok", "gemini", "claude"}
+EXPECTED_PROFILES = {"generic", "openai", "grok", "gemini", "claude", "zai"}
 EXPECTED_PROXY_SOURCES = {
     "proxifly",
     "proxynova",
