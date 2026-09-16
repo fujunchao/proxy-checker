@@ -1,0 +1,59 @@
+# Proxy Checker — Docker Compose 部署
+#
+#   docker compose up -d --build      # 构建并启动
+#   docker compose logs -f            # 跟踪日志
+#   docker compose down               # 停止（数据保留在 ./data）
+#
+# 环境变量可写在同目录的 .env 文件里（参考 .env.example）。
+
+services:
+  proxy-checker:
+    build:
+      context: .
+      args:
+        # 设为 "0" 可去掉 Node.js 让镜像更小，代价是 ProxyNova 源无法解析
+        WITH_NODE: "1"
+    image: proxy-checker:6.4
+    container_name: proxy-checker
+    restart: unless-stopped
+
+    ports:
+      - "${HOST_PORT:-8888}:8888"
+
+    environment:
+      # --- 服务 ---
+      PORT: "8888"
+      TZ: "${TZ:-Asia/Shanghai}"
+
+      # --- 鉴权（公网部署务必修改）---
+      AUTH_PASSWORD: "${AUTH_PASSWORD:-linux.do}"
+      AUTH_SESSION_DAYS: "${AUTH_SESSION_DAYS:-7}"
+
+      # --- 检测默认值 ---
+      # 注意：这里设了就相当于「钉死」，网页「设置」弹窗里的修改在容器重启后会被环境变量覆盖回去。
+      # 想完全用网页设置来管理，请把下面几行注释掉。
+      APP_TIMEZONE: "${APP_TIMEZONE:-Asia/Shanghai}"
+      CHECK_ROUNDS: "${CHECK_ROUNDS:-2}"
+      MAX_CONCURRENT: "${MAX_CONCURRENT:-30}"
+
+      # --- 运行期状态（指向挂载卷）---
+      DATA_DIR: "/data"
+      CONFIG_LOCAL_PATH: "/data/config.local.json"
+      LOG_FILE: "/data/server.log"
+
+      # --- 卷内文件属主，与 ./data 的宿主属主保持一致 ---
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+
+    volumes:
+      - ./data:/data
+
+    # 自动任务批量检测上万条代理时，默认 1024 的文件描述符可能不够
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+    # server.py 没有实现 SIGTERM 优雅退出，给 20 秒让进行中的请求自然收尾；
+    # 被杀掉的自动任务会在下次启动时被标记为 interrupted 并重新排期。
+    stop_grace_period: 20s

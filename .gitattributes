@@ -1,0 +1,7 @@
+# 只对「换行符会真正破坏功能」的文件强制 LF，避免影响仓库里其它文件的现有换行处理。
+# 关键场景：在 Windows 上编辑 docker/entrypoint.sh 后推送到 Debian 服务器，
+# 若带 CRLF，shebang 会变成 `#!/bin/sh\r` 直接报 "not found"。
+*.sh text eol=lf
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+*.dockerfile text eol=lf

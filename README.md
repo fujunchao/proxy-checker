@@ -224,6 +224,26 @@ http://localhost:8888
 linux.do
 ```
 
+## 用 Docker 部署
+
+不想在服务器上装 Python 环境的话，仓库已经内置了容器化方案（`Dockerfile` + `docker-compose.yml`），运行期状态统一落在 `./data` 卷里，容器重建不丢数据：
+
+```bash
+git clone https://github.com/strongshuai/proxy-checker.git
+cd proxy-checker
+cp .env.example .env          # 至少把 AUTH_PASSWORD 改掉
+mkdir -p data
+docker compose up -d --build
+```
+
+镜像默认监听 `8888`，支持 `amd64` / `arm64` 双架构，自带健康检查与非 root 运行；`docker compose logs -f` 看日志，备份直接打包 `data/` 目录即可。自助部署也可以直接拉取预构建镜像：
+
+```bash
+docker pull ghcr.io/fujunchao/proxy-checker:latest
+```
+
+完整说明（环境变量对照表、反向代理与 HTTPS、卷与权限、自动任务在容器里的行为、常见问题排障）见 [DOCKER.md](./DOCKER.md)。
+
 ## 部署位置很重要
 
 最好把 Proxy Checker 部署在你实际跑号、跑业务、调用目标服务的那台服务器上。

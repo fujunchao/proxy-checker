@@ -20,7 +20,8 @@ except ImportError:
 from proxy_check import CheckConfig, DEFAULT_TARGET_CHAT, ProxyCheckEngine, TARGET_PROFILE_OPTIONS
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_LOCAL_PATH = os.path.join(BASE_DIR, "config.local.json")
+# 容器化部署时可用 CONFIG_LOCAL_PATH 把运行期配置指向挂载卷；不设置则保持原有行为（源码目录旁）。
+CONFIG_LOCAL_PATH = os.environ.get("CONFIG_LOCAL_PATH") or os.path.join(BASE_DIR, "config.local.json")
 
 
 def load_config():
