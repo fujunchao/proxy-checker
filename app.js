@@ -61,7 +61,7 @@ var targetProfiles=[
   {id:'grok',name:'Grok 检测',has_api:true,has_signup:false,has_cf_detection:true},
   {id:'gemini',name:'Gemini 检测',has_api:true,has_signup:false,has_cf_detection:false},
   {id:'claude',name:'Claude 检测',has_api:true,has_signup:false,has_cf_detection:true},
-  {id:'zai',name:'Z.AI 检测',has_api:true,has_signup:false,has_cf_detection:true}
+  {id:'zai',name:'Z.AI / ZCode 检测',has_api:true,has_signup:false,has_cf_detection:true}
 ];
 var currentTargetProfile=localStorage.getItem(TARGET_PROFILE_KEY)||'generic';
 
@@ -622,11 +622,18 @@ function activeFilter(selector){
   return active?active.dataset.f:'all';
 }
 
+function auxReachable(r,key){
+  var aux=r&&r.aux_reachable;
+  return !!(aux&&aux[key]===true);
+}
+
 function resultPassesValidFilter(r,f){
   var lat=parseInt(r.latency||99999,10);
   var profile=getTargetProfileInfo(currentTargetProfile);
   if(f==='stable')return !!r.valid;
   if(f==='unstable')return !!r.unstable;
+  if(f==='usable')return r.usable===true;
+  if(f==='zcode')return auxReachable(r,'zcode');
   if(f==='cf_bypass')return profile.has_cf_detection?!!r.cf_bypass:!!r.service_reachable;
   if(f==='api_or_ip')return profile.has_api?r.api_reachable===true:!!r.ip;
   if(f==='fast')return lat<1000;
@@ -785,6 +792,13 @@ function tagTitle(kind,value){
     api_unknown:'当前检测模式没有拿到 API 结果，不能据此判断 API 是否可用。',
     checks:'多轮检测通过数/总轮数，数字越接近满分越稳定。',
     latency:'通过这个代理完成检测请求的大致耗时，越低越快，但只代表本次检测。',
+    aux_ok:'当前模式的附加目标（例如 ZCode 业务入口 zcode.z.ai）能通过这个代理连上。它是本模式「可用」的必要条件。',
+    aux_fail:'当前模式的附加目标连不上。就算网页和 API 域名都通，这条线路对该模式要用的服务也没用。',
+    protocol_note:'协议提示：部分客户端或语言标准库不支持该协议（例如 Go 标准库的代理探测不支持 socks4）。',
+    usable_ok:'本模式的达标门槛全部通过，这条线路可以用于该模式的目标服务。',
+    usable_bad:'本模式的达标门槛没通过（评级只是线路本身的质量，不代表对本模式目标可用）。',
+    streak:'连续通过复测的轮次。免费代理寿命很短，连续多轮通过才算得上稳定。',
+    shared_ip:'同一个出口 IP 出现在多条线路里，这些代理很可能是同一个来源。',
     error:'后端返回的失败原因或 HTTP 状态，仅用于排查，不一定代表代理完全不可用。'
   };
   return text[kind]||'这个标签是当前检测结果的一项摘要。';
@@ -842,6 +856,31 @@ function itemHTML(r,type){
   else if(r.api_reachable===false) apiTag=tagHTML('tag-fail','API域名不可达',tagTitle('api_fail'));
   else if(profileInfo.has_api) apiTag=tagHTML('','API未检测',tagTitle('api_unknown'),'background:rgba(255,255,255,.06);color:#666');
 
+  // 附加目标（aux）标签。只有当前模式真的声明了附加探针（结果里带 aux_reachable）才显示，
+  // 没有 aux 的模式一个标签都不多。
+  var auxKeys=r.aux_reachable?Object.keys(r.aux_reachable):[];
+  var auxAllOk=false;
+  var auxTag='';
+  if(auxKeys.length){
+    var auxNames=[];
+    var auxOkCount=0;
+    auxKeys.forEach(function(k){
+      var ok=auxReachable(r,k);
+      if(ok)auxOkCount++;
+      auxNames.push((k==='zcode'?'ZCode入口':k)+(ok?'可达':'不可达'));
+    });
+    auxAllOk=auxOkCount===auxKeys.length;
+    auxTag=tagHTML(auxAllOk?'tag-ok':'tag-fail','&#128279; '+esc(auxNames.join(' / ')),tagTitle(auxAllOk?'aux_ok':'aux_fail'));
+  }
+
+  // 本档可用性（达标门槛结论），与 grade 是两件事
+  var usableTag='';
+  if(r.usable===true) usableTag=tagHTML('tag-ok','&#127919; 本档可用',tagTitle('usable_ok'));
+  else if(r.usable===false) usableTag=tagHTML('tag-fail','&#127919; 本档不可用',tagTitle('usable_bad'));
+
+  // 协议提示（例如 socks4）
+  var protoNoteTag=r.protocol_note?tagHTML('','&#9888; '+esc(r.detected_protocol||'')+' 协议',esc(tagTitle('protocol_note')),'background:rgba(234,179,8,.15);color:#eab308'):'';
+
   // Check count tag
   var chkTag='';
   if(r.checks_total!==undefined){
@@ -866,15 +905,23 @@ function itemHTML(r,type){
     if(d.service) rows+='<div class="detail-row"><span class="detail-key">服务:</span><span>'+(d.service.status||'-')+' '+(d.service.reachable?'<span style="color:#22c55e">可达</span>':'<span style="color:#ef4444">不可达</span>')+(d.service.cf_detected?' <span style="color:#ef4444">CF:'+esc(d.service.cf_type||'detected')+'</span>':'')+'</span></div>';
     else if(d.chat) rows+='<div class="detail-row"><span class="detail-key">首页:</span><span>'+(d.chat.status||'-')+(d.chat.cf_detected?' <span style="color:#ef4444">CF:'+esc(d.chat.cf_type||'detected')+'</span>':'')+'</span></div>';
     if(d.api) rows+='<div class="detail-row"><span class="detail-key">API域名:</span><span>'+(d.api.status||'-')+' '+(d.api.reachable?'<span style="color:#22c55e">可达</span>':'<span style="color:#ef4444">不可达</span>')+'</span></div>';
+    if(d.aux && typeof d.aux==='object'){
+      Object.keys(d.aux).forEach(function(k){
+        var a=d.aux[k]||{};
+        var state=a.ok?'<span style="color:#22c55e">可达</span>':(a.blocked?'<span style="color:#ef4444">拦截/占位页</span>':'<span style="color:#ef4444">不可达</span>');
+        rows+='<div class="detail-row"><span class="detail-key">'+esc(a.label||k)+':</span><span>'+(a.status||'-')+' '+state+(a.reason?' '+esc(a.reason):'')+(a.error?' '+esc(a.error):'')+'</span></div>';
+      });
+    }
+    if(r.usable_reason) rows+='<div class="detail-row"><span class="detail-key">达标门槛:</span><span style="color:#ef4444">'+esc(r.usable_reason)+'</span></div>';
     if(d.ip_info) rows+='<div class="detail-row"><span class="detail-key">IP信息:</span><span>'+esc(d.ip_info.org||'')+' ('+esc(d.ip_info.country||'')+')</span></div>';
     if(r.cf_indicators && r.cf_indicators.length>0) rows+='<div class="detail-row"><span class="detail-key">CF特征:</span><span style="color:#ef4444">'+esc(r.cf_indicators.join(', '))+'</span></div>';
     detailHTML='<div class="detail-panel" id="'+detailId+'">'+rows+'</div>';
   }
 
-  return '<div class="proxy-item '+type+'" data-lat="'+(r.latency||99999)+'" data-err="'+(err?"y":"n")+'" data-stable="'+(r.valid?"y":r.unstable?"u":"n")+'" data-service="'+(r.service_reachable?"y":"n")+'" data-api="'+(r.api_reachable===true?"y":"n")+'" data-ip="'+(r.ip?"y":"n")+'" data-cf="'+(r.cf_bypass?"y":"n")+'" data-cf-challenge="'+(r.cf_challenge_type||"")+'" data-grade="'+g+'" data-ip-type="'+(r.ip_type||"")+'" data-country="'+(country?"y":"n")+'" onclick="toggleDetail(\''+detailId+'\')">'+
+  return '<div class="proxy-item '+type+'" data-lat="'+(r.latency||99999)+'" data-err="'+(err?"y":"n")+'" data-stable="'+(r.valid?"y":r.unstable?"u":"n")+'" data-service="'+(r.service_reachable?"y":"n")+'" data-api="'+(r.api_reachable===true?"y":"n")+'" data-ip="'+(r.ip?"y":"n")+'" data-cf="'+(r.cf_bypass?"y":"n")+'" data-cf-challenge="'+(r.cf_challenge_type||"")+'" data-grade="'+g+'" data-ip-type="'+(r.ip_type||"")+'" data-country="'+(country?"y":"n")+'" data-aux="'+(auxKeys.length?(auxAllOk?"y":"n"):"")+'" data-usable="'+(r.usable===true?"y":r.usable===false?"n":"")+'" onclick="toggleDetail(\''+detailId+'\')">'+
     '<div style="flex:1;min-width:0">'+
     '<div class="proxy-addr">'+esc(r.proxy)+'</div>'+
-    '<div class="proxy-meta">'+targetTag+gradeTag+useTag+chkTag+serviceTag+cfTag+ipTag+countryTag+ipTypeTag+apiTag+errTag+'</div>'+
+    '<div class="proxy-meta">'+targetTag+gradeTag+useTag+chkTag+serviceTag+cfTag+ipTag+countryTag+ipTypeTag+apiTag+auxTag+usableTag+protoNoteTag+errTag+'</div>'+
     detailHTML+
     '</div>'+
     '<div style="display:flex;align-items:center;gap:8px;flex-shrink:0">'+
@@ -1413,7 +1460,7 @@ function showAutoModal(data){
   html+='<div class="auto-field"><label>计划时区</label><select id="autoTimezone">'+timezoneOptions(config.timezone||appSettings.timezone)+'</select></div>';
   html+='<div class="auto-field"><label>检测模式</label><select id="autoTargetProfile">'+autoProfileOptions(config.target_profile||currentTargetProfile)+'</select></div>';
   html+='<div class="auto-field"><label>检测范围</label><select id="autoDetectMode"><option value="skip">只检测新代理</option><option value="force">强制检测全部</option></select></div>';
-  html+='<div class="auto-field full"><label>入库策略</label><select id="autoRepoPolicy"><option value="stable_only">只入库稳定可用(A/B/C)，复测失败旧代理会删除</option><option value="include_unstable">包含不稳定(A/B/C/D)，复测失败旧代理会删除</option><option value="archive_all">所有结果都留档，失效代理也保留</option></select></div>';
+  html+='<div class="auto-field full"><label>入库策略</label><select id="autoRepoPolicy"><option value="stable_only">只入库稳定可用(A/B)，复测失败旧代理会删除</option><option value="target_only">只入库本档目标可用(usable)，最严格</option><option value="include_unstable">包含不稳定(A/B/C/D)，复测失败旧代理会删除</option><option value="archive_all">所有结果都留档，失效代理也保留</option></select></div>';
   html+='<div class="auto-field full"><div class="settings-note">本轮自动检测使用全局设置：'+esc(getRoundsValue())+' 轮，并发 '+esc(getConcurrentValue())+'。要修改请打开“设置”。</div></div>';
   html+='</div>';
   html+='<div class="auto-action-row">';
@@ -1660,6 +1707,29 @@ function clearRunLogs(){
     showRunLogsModal(res.logs||[]);
     toast('检测日志已清空');
   });
+}
+
+var repoLinkToken='';
+
+function repoExportQuery(){
+  var parts=[];
+  var usable=document.getElementById('repoOnlyUsable');
+  var socks4=document.getElementById('repoExcludeSocks4');
+  var shared=document.getElementById('repoExcludeShared');
+  if(usable&&usable.checked)parts.push('usable=1');
+  if(socks4&&socks4.checked)parts.push('exclude_socks4=1');
+  if(shared&&shared.checked)parts.push('exclude_shared_ip=1');
+  return parts.length?('?'+parts.join('&')):'';
+}
+
+function updateRepoExportLinks(){
+  var query=repoExportQuery();
+  var txt=document.getElementById('repoTxtLinkInput');
+  var jsn=document.getElementById('repoJsonLinkInput');
+  if(txt)txt.value=API_BASE+'/api/repo/'+repoLinkToken+'.txt'+query;
+  if(jsn)jsn.value=API_BASE+'/api/repo/'+repoLinkToken+'.json'+query;
+  var note=document.getElementById('repoExportNote');
+  if(note)note.textContent=query?('已加过滤：'+query.slice(1)):'当前是全部代理（未加过滤）';
 }
 
 function syncRepoToServer(repoOverride){
@@ -1989,6 +2059,11 @@ function addSingleResultToRepo(button){
   else toast('仓库已更新，稍后自动同步云端');
 }
 
+function proxyProto(value){
+  var text=String(value||'');
+  return text.indexOf('://')>0?text.split('://')[0].toLowerCase():'';
+}
+
 function repoPassesFilter(p,f){
   var g=p.grade||'F';
   var country=p.country?String(p.country).toUpperCase():'';
@@ -1996,6 +2071,9 @@ function repoPassesFilter(p,f){
   if(f==='grade_b')return g==='B';
   if(f==='grade_c')return g==='C';
   if(f==='grade_d')return g==='D';
+  if(f==='usable')return p.usable===true;
+  if(f==='zcode')return auxReachable(p,'zcode');
+  if(f==='shared')return p.ip_shared===true;
   if(f==='service')return p.service_reachable===true;
   if(f==='api')return p.api_reachable===true;
   if(f==='cf')return !!p.cf_bypass;
@@ -2045,6 +2123,11 @@ function renderRepo(){
       (country?tagHTML('tag-country','国家: '+esc(country),tagTitle('country')):'')+
       (p.ip_type==='datacenter'?tagHTML('tag-dc','机房',getIpTypeTitle(p.ip_type)):p.ip_type==='residential'?tagHTML('tag-res','住宅',getIpTypeTitle(p.ip_type)):'')+
       (p.cf_bypass?tagHTML('tag-cf','网页CF未拦截',tagTitle('cf_ok')):'')+
+      (p.aux_reachable?tagHTML(auxReachable(p,'zcode')?'tag-ok':'tag-fail','&#128279; ZCode入口'+(auxReachable(p,'zcode')?'可达':'不可达'),tagTitle(auxReachable(p,'zcode')?'aux_ok':'aux_fail')):'')+
+      (p.usable===true?tagHTML('tag-ok','&#127919; 本档可用',tagTitle('usable_ok')):p.usable===false?tagHTML('tag-fail','&#127919; 本档不可用',tagTitle('usable_bad')):'')+
+      (p.pass_streak>1?tagHTML('','&#128200; 连续'+esc(p.pass_streak)+'轮',tagTitle('streak'),'background:rgba(34,197,94,.15);color:#22c55e'):'')+
+      (p.ip_shared?tagHTML('','&#128101; 共享出口',tagTitle('shared_ip'),'background:rgba(234,179,8,.15);color:#eab308'):'')+
+      (p.protocol_note?tagHTML('','&#9888; '+esc(proxyProto(p.proxy))+' 协议',tagTitle('protocol_note'),'background:rgba(234,179,8,.15);color:#eab308'):'')+
       '</div></div>'+
       '<div style="display:flex;align-items:center;gap:8px;flex-shrink:0">'+
       (p.latency?tagHTML('tag-lat','<span class="speed-dot '+spd+'"></span>'+esc(lat),tagTitle('latency')):'')+
@@ -2358,6 +2441,7 @@ function getRepoLink(button){
     }
     if(err||!res||res.error){toast('同步失败: '+(err||(res&&res.error)||'无响应'));return}
     rememberRepoSync(res.count);
+    repoLinkToken=token;
     var txtUrl=API_BASE+'/api/repo/'+token+'.txt';
     var jsonUrl=API_BASE+'/api/repo/'+token+'.json';
     copyText(txtUrl);
@@ -2372,7 +2456,14 @@ function getRepoLink(button){
     html+='<label style="display:block;text-align:left;color:#888;font-size:12px;font-weight:700;margin-bottom:6px">TXT 链接</label>';
     html+='<input id="repoTxtLinkInput" readonly value="'+txtUrl+'" style="width:100%;padding:12px 14px;background:#0d0d1a;border:1px solid rgba(255,255,255,.1);border-radius:10px;color:#e0e0e0;font-family:monospace;font-size:12px;margin-bottom:12px">';
     html+='<label style="display:block;text-align:left;color:#888;font-size:12px;font-weight:700;margin-bottom:6px">JSON 链接</label>';
-    html+='<input id="repoJsonLinkInput" readonly value="'+jsonUrl+'" style="width:100%;padding:12px 14px;background:#0d0d1a;border:1px solid rgba(255,255,255,.1);border-radius:10px;color:#e0e0e0;font-family:monospace;font-size:12px;margin-bottom:20px">';
+    html+='<input id="repoJsonLinkInput" readonly value="'+jsonUrl+'" style="width:100%;padding:12px 14px;background:#0d0d1a;border:1px solid rgba(255,255,255,.1);border-radius:10px;color:#e0e0e0;font-family:monospace;font-size:12px;margin-bottom:14px">';
+    html+='<div style="text-align:left;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:12px 14px;margin-bottom:18px">';
+    html+='<div style="color:#888;font-size:12px;font-weight:700;margin-bottom:8px">导出过滤（可选，勾选后链接自动带上参数）</div>';
+    html+='<label style="display:flex;align-items:center;gap:8px;color:#ccc;font-size:13px;margin-bottom:6px"><input type="checkbox" id="repoOnlyUsable" onchange="updateRepoExportLinks()"> 只要本档可用的（usable）</label>';
+    html+='<label style="display:flex;align-items:center;gap:8px;color:#ccc;font-size:13px;margin-bottom:6px"><input type="checkbox" id="repoExcludeSocks4" onchange="updateRepoExportLinks()"> 排除 socks4（部分客户端不支持）</label>';
+    html+='<label style="display:flex;align-items:center;gap:8px;color:#ccc;font-size:13px"><input type="checkbox" id="repoExcludeShared" onchange="updateRepoExportLinks()"> 排除共享出口（同一 IP 多条线路）</label>';
+    html+='<div id="repoExportNote" style="color:#666;font-size:11px;margin-top:8px">当前是全部代理（未加过滤）</div>';
+    html+='</div>';
     html+='<div style="display:flex;gap:10px;justify-content:center">';
     html+='<button class="btn btn-ghost" onclick="navigator.clipboard.writeText(document.getElementById(\'repoTxtLinkInput\').value);toast(\'已复制TXT链接\')">📋 复制TXT</button>';
     html+='<button class="btn btn-ghost" onclick="navigator.clipboard.writeText(document.getElementById(\'repoJsonLinkInput\').value);toast(\'已复制JSON链接\')">📋 复制JSON</button>';

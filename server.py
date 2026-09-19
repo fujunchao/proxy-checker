@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from http import cookies
 from http.server import HTTPServer
 from socketserver import ThreadingMixIn
+from urllib.parse import parse_qs, urlparse
 
 try:
     from zoneinfo import ZoneInfo
@@ -162,6 +163,14 @@ auto_runtime = {}
 auto_stopped_results = {}
 auto_lock = threading.Lock()
 TARGET_PROFILE_IDS = {str(item["id"]) for item in TARGET_PROFILE_OPTIONS}
+# 仓库入库策略。target_only 比 stable_only 更严：只收「对本档目标确实可用」的线路
+# （result.usable，由档位的 required_probes 门禁给出）。集中定义避免多处白名单漂移。
+REPO_UPDATE_POLICIES = ("stable_only", "include_unstable", "archive_all", "target_only")
+# 订阅导出（/api/repo/<token>.txt|json）支持的可选过滤参数。不带任何参数时行为与从前完全一致。
+EXPORT_PARAMS = ("grade", "usable", "stable", "proto", "comment", "limit", "exclude_socks4", "exclude_shared_ip")
+# 连续通过多少轮复测才算「稳定」。免费代理单轮通过说明不了什么，寿命以分钟计。
+STABLE_PASS_STREAK = 2
+EXPORT_PROTOCOLS = ("http", "https", "socks4", "socks5", "socks5h")
 
 
 def normalize_target_profile(value):
@@ -337,13 +346,22 @@ def compact_repo_item(item):
         return None
     now = int(time.time() * 1000)
     compact = {"proxy": proxy, "grade": str(item.get("grade") or "?")}
-    for key in ("latency", "ip", "country", "ip_type", "recommended_use", "target_profile", "target_name"):
+    for key in ("latency", "ip", "country", "ip_type", "recommended_use", "target_profile", "target_name",
+                "usable", "usable_reason", "protocol_note", "last_ok"):
         value = item.get(key)
         if value is not None and value != "":
             compact[key] = value
-    for key in ("service_reachable", "api_reachable", "cf_bypass"):
+    for key in ("service_reachable", "api_reachable", "cf_bypass", "ip_shared"):
         if item.get(key) is True:
             compact[key] = True
+    # 计数类只在非零时写入，免得给每条都塞两个 0。
+    for key in ("pass_streak", "fail_count"):
+        value = item.get(key)
+        if isinstance(value, int) and value > 0:
+            compact[key] = value
+    # 附加探针结论（key → 是否可达）。空 dict 不写入，避免给旧数据塞无用键。
+    if item.get("aux_reachable"):
+        compact["aux_reachable"] = item["aux_reachable"]
     compact["added"] = item.get("added") or now
     compact["updated"] = item.get("updated") or compact["added"]
     return compact
@@ -378,9 +396,29 @@ def read_repo_data(token):
         return compact_repo({"proxy": line.strip()} for line in f if line.strip())
 
 
+def annotate_shared_ips(repo):
+    """标注出口 IP 被多条线路复用的情况。
+
+    免费代理源里同一个出口挂在多个代理地址上是常见现象，这类「看着多条、其实同源」的
+    记录会虚增选择面；标出来之后可用导出参数 exclude_shared_ip=1 排除，前端也能打标签。
+    """
+    counts = {}
+    for item in repo:
+        ip = item.get("ip")
+        if ip:
+            counts[ip] = counts.get(ip, 0) + 1
+    for item in repo:
+        ip = item.get("ip")
+        if ip and counts.get(ip, 0) > 1:
+            item["ip_shared"] = True
+        else:
+            item.pop("ip_shared", None)  # 不再共享就清掉，免得留下陈旧标记
+    return repo
+
+
 def write_repo_data(token, repo):
     token = sanitize_token(token)
-    repo = compact_repo(repo)
+    repo = annotate_shared_ips(compact_repo(repo))
     atomic_write_json(repo_json_path(token), repo)
     atomic_write_text(repo_txt_path(token), "\n".join(item["proxy"] for item in repo))
     return repo
@@ -444,6 +482,67 @@ def save_repo_payload(token, incoming, mode="merge", base_count=None):
         "current_count": current_count,
         "submitted_count": len(incoming_repo),
     }
+
+
+def truthy_param(value):
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def proto_of(proxy):
+    text = str(proxy or "")
+    return text.split("://", 1)[0].strip().lower() if "://" in text else ""
+
+
+def repo_export_filtered(params):
+    """该请求是否带了我们认识的过滤参数（决定走动态渲染还是直接吐原文件）。"""
+    return any(key in params for key in EXPORT_PARAMS)
+
+
+def filter_repo_for_export(repo, params):
+    """按订阅链接的查询参数过滤仓库条目。
+
+    设计约束：**没带任何识别到的参数时原样返回**，让 /api/repo/<token>.txt 这类老订阅链接
+    的行为逐字不变（老链接往往已经挂在别人的脚本里）。
+    """
+    items = list(repo)
+    grades = {part.strip().upper() for part in ",".join(params.get("grade") or []).split(",") if part.strip()}
+    if grades:
+        items = [item for item in items if str(item.get("grade") or "F").upper() in grades]
+    if truthy_param((params.get("usable") or [""])[0]):
+        items = [item for item in items if item.get("usable") is True]
+    if truthy_param((params.get("stable") or [""])[0]):
+        items = [item for item in items if int(item.get("pass_streak") or 0) >= STABLE_PASS_STREAK]
+    protocols = {part.strip().lower() for part in ",".join(params.get("proto") or []).split(",") if part.strip()}
+    protocols &= set(EXPORT_PROTOCOLS)
+    if protocols:
+        items = [item for item in items if proto_of(item.get("proxy")) in protocols]
+    if truthy_param((params.get("exclude_socks4") or [""])[0]):
+        items = [item for item in items if proto_of(item.get("proxy")) != "socks4"]
+    if truthy_param((params.get("exclude_shared_ip") or [""])[0]):
+        items = [item for item in items if item.get("ip_shared") is not True]
+    limit_text = str((params.get("limit") or [""])[0]).strip()
+    if limit_text.isdigit() and int(limit_text) > 0:
+        items = items[:int(limit_text)]
+    return items
+
+
+def render_repo_txt(items, comment=False):
+    """把仓库条目渲染成订阅 TXT。comment=True 时每行前附一行 # 元信息（默认关，保持兼容）。"""
+    lines = []
+    for item in items:
+        proxy = str(item.get("proxy") or "").strip()
+        if not proxy:
+            continue
+        if comment:
+            meta = " ".join(
+                f"{key}={item[key]}"
+                for key in ("grade", "ip", "country", "ip_type", "latency", "pass_streak")
+                if item.get(key) not in (None, "")
+            )
+            if meta:
+                lines.append(f"# {meta}")
+        lines.append(proxy)
+    return "\n".join(lines)
 
 
 def read_checked_list(token):
@@ -624,7 +723,7 @@ def normalize_auto_config(config):
     if detect_mode not in ("skip", "force"):
         detect_mode = "skip"
     repo_update_policy = str(merged.get("repo_update_policy") or "stable_only")
-    if repo_update_policy not in ("stable_only", "include_unstable", "archive_all"):
+    if repo_update_policy not in REPO_UPDATE_POLICIES:
         repo_update_policy = "stable_only"
     return {
         "enabled": bool(merged.get("enabled")),
@@ -992,6 +1091,16 @@ def result_to_repo_item(result, existing=None):
         ip_info = checks_detail.get("ip_info")
         if isinstance(ip_info, dict):
             country = ip_info.get("country")
+    ok = result.get("usable") is True
+    streak = int(existing.get("pass_streak") or 0)
+    fail_count = int(existing.get("fail_count") or 0)
+    # 连续通过才算稳定：通过则累加，失败则清零并累计失败次数。
+    if ok:
+        streak += 1
+        fail_count = 0
+    else:
+        streak = 0
+        fail_count += 1
     item = {
         "proxy": result.get("proxy") or result.get("original"),
         "grade": result.get("grade") or "F",
@@ -1001,6 +1110,13 @@ def result_to_repo_item(result, existing=None):
         "ip_type": result.get("ip_type"),
         "service_reachable": result.get("service_reachable") is True,
         "api_reachable": result.get("api_reachable") is True,
+        "aux_reachable": result.get("aux_reachable") or None,
+        "usable": result.get("usable") is True,
+        "usable_reason": result.get("usable_reason") or None,
+        "protocol_note": result.get("protocol_note") or None,
+        "pass_streak": streak,
+        "fail_count": fail_count,
+        "last_ok": now if ok else existing.get("last_ok"),
         "cf_bypass": result.get("cf_bypass") is True,
         "recommended_use": result.get("recommended_use"),
         "target_profile": result.get("target_profile"),
@@ -1011,17 +1127,41 @@ def result_to_repo_item(result, existing=None):
     return compact_repo_item(item)
 
 
+def result_summary(result):
+    checks_detail = result.get("checks_detail")
+    if not isinstance(checks_detail, dict):
+        return {}
+    summary = checks_detail.get("summary")
+    return summary if isinstance(summary, dict) else {}
+
+
+def result_has_gate(result):
+    """这条结果来自声明过达标门槛（required_probes）的档位。"""
+    return bool(result_summary(result).get("required_probes"))
+
+
 def result_matches_policy(result, policy):
+    """按入库策略判断这条结果该不该留在仓库里。
+
+    声明过达标门槛的档位（如 zai）一律以 usable 为准：门禁不通过的线路哪怕 grade 是 A/B/C
+    也留不得——它对本档目标根本用不了（典型是能开 z.ai 网页、出口 IP 也活，却到不了 ZCode
+    业务域名）。未声明门槛的档位（generic 与既有 5 档）保持原有口径不变，避免顺手改变它们
+    的行为：对没有「目标」概念的档位，C 级（只通网页或只通出口 IP）依然有价值。
+    """
     grade = str(result.get("grade") or "F")
     if policy == "archive_all":
         return True
+    if policy == "target_only":
+        return result.get("usable") is True
     if policy == "include_unstable":
-        return grade in ("A", "B", "C", "D") or result.get("valid") or result.get("unstable")
-    return grade in ("A", "B", "C") or result.get("valid")
+        return bool(grade in ("A", "B", "C", "D") or result.get("valid") or result.get("unstable"))
+    if result_has_gate(result):
+        return result.get("usable") is True
+    return bool(grade in ("A", "B", "C") or result.get("valid"))
 
 
 def merge_repo_results(token, repo, results, checked_inputs, policy):
-    policy = policy if policy in ("stable_only", "include_unstable", "archive_all") else "stable_only"
+    policy = policy if policy in REPO_UPDATE_POLICIES else "stable_only"
     participating = {proxy_key(proxy) for proxy in checked_inputs}
     result_by_key = {}
     for result in results:
@@ -1607,39 +1747,50 @@ class Handler(SimpleHTTPRequestHandler):
         # Serve repo as JSON: /api/repo/<token>.json
         if path.startswith("/api/repo/") and path.endswith(".json"):
             token = path.split("/")[-1].replace(".json", "")
+            params = parse_qs(urlparse(self.path).query)
             json_file = os.path.join(REPO_DIR, f"{token}.json")
+            payload = b"[]"
             if os.path.isfile(json_file):
-                with open(json_file, "r") as f:
+                with open(json_file, "r", encoding="utf-8") as f:
                     content = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(content.encode("utf-8"))
-            else:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(b"[]")
+                if repo_export_filtered(params):
+                    data = read_json_file(json_file, [])
+                    content = json.dumps(
+                        filter_repo_for_export(data if isinstance(data, list) else [], params),
+                        ensure_ascii=False,
+                    )
+                payload = content.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
             return
 
         # Serve repo as txt: /api/repo/<token>.txt
+        # 带过滤参数时改为读仓库 JSON 动态渲染；不带参数仍直接吐文件，保证老订阅链接逐字不变。
         if path.startswith("/api/repo/") and path.endswith(".txt"):
             token = path.split("/")[-1].replace(".txt", "")
+            params = parse_qs(urlparse(self.path).query)
             repo_file = os.path.join(REPO_DIR, f"{token}.txt")
-            if os.path.isfile(repo_file):
-                with open(repo_file, "r") as f:
-                    content = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(content.encode("utf-8"))
-            else:
+            if not os.path.isfile(repo_file):
                 self.send_response(404)
                 self.end_headers()
                 self.wfile.write(b"Repository not found")
+                return
+            if repo_export_filtered(params):
+                content = render_repo_txt(
+                    filter_repo_for_export(read_repo_data(token), params),
+                    comment=truthy_param((params.get("comment") or [""])[0]),
+                )
+            else:
+                with open(repo_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(content.encode("utf-8"))
             return
         # Serve checked proxies as txt: /api/checked/<token>.txt
         if path.startswith("/api/checked/") and path.endswith(".txt"):

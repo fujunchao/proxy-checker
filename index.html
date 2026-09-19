@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>通用代理检测器 v6.5</title>
+<title>通用代理检测器 v6.6</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f0f23;color:#e0e0e0;min-height:100vh}
@@ -207,7 +207,7 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 <!-- Header -->
 <div class="header">
 <div class="header-title">
-<h1>&#128269; 通用代理检测器 v6.5</h1>
+<h1>&#128269; 通用代理检测器 v6.6</h1>
 <p>常规连通性 &middot; AI 服务专项检测 &middot; IP类型识别 &middot; 仓库同步</p>
 </div>
 </div>
@@ -303,6 +303,8 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 <div class="filter-bar" id="vFilters" style="margin-bottom:0">
 <button class="fbtn active" data-f="all">🔎 全部</button>
 <button class="fbtn" data-f="stable">✅ 稳定</button>
+<button class="fbtn" data-f="usable">🎯 本档可用</button>
+<button class="fbtn" data-f="zcode">🔗 ZCode入口可达</button>
 <button class="fbtn" data-f="unstable">⚠️ 不稳定</button>
 <button class="fbtn" id="filterServiceBtn" data-f="cf_bypass">🌐 服务可达</button>
 <button class="fbtn" id="filterApiBtn" data-f="api_or_ip">🔌 出口IP</button>
@@ -363,6 +365,9 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 <button class="fbtn" data-f="service">🌐 服务可达</button>
 <button class="fbtn" data-f="api">🔌 API域名可达</button>
 <button class="fbtn" data-f="cf">🛡️ 网页CF未拦截</button>
+<button class="fbtn" data-f="usable">🎯 本档可用</button>
+<button class="fbtn" data-f="zcode">🔗 ZCode入口可达</button>
+<button class="fbtn" data-f="shared">👥 共享出口</button>
 <button class="fbtn" data-f="dc">🏢 机房</button>
 <button class="fbtn" data-f="res">🏠 住宅</button>
 <button class="fbtn" data-f="country">🌍 有国家</button>
