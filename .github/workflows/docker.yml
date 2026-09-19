@@ -1,7 +1,7 @@
 name: docker
 
 # 构建多架构镜像并推送到 GHCR：
-#   ghcr.io/<owner>/proxy-checker:<tag>      （推送 v* tag 时，例如 v6.5）
+#   ghcr.io/<owner>/proxy-checker:<tag>      （推送 v* tag 时，例如 v6.6）
 #   ghcr.io/<owner>/proxy-checker:latest     （打 tag 或手动触发时，指向最近一次构建）
 #   ghcr.io/<owner>/proxy-checker:sha-xxxxxxx
 #
