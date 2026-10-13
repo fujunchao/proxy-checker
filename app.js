@@ -24,6 +24,9 @@ var ACTIVE_SESSION_KEY='proxy_checker_active_session';
 var AUTH_TOKEN_KEY='proxy_checker_auth_token';
 var authRequired=false;
 var authenticated=false;
+var workspaceReady=false;
+var initializedWorkspace=null;
+var serverWorkspaceToken='';
 var autoModeAvailable=false;
 var autoStatusTimer=null;
 var autoStatusCache=null;
@@ -187,6 +190,11 @@ function requireAuthenticatedUI(){
     toast('请输入登录密码');
     return false;
   }
+  if(!workspaceReady){
+    toast('正在确认数据身份，请稍后重试');
+    checkCapabilities();
+    return false;
+  }
   return true;
 }
 
@@ -236,6 +244,8 @@ function logoutAuth(){
   post('/api/auth/logout',{},function(){});
   localStorage.removeItem(AUTH_TOKEN_KEY);
   authenticated=false;
+  workspaceReady=false;
+  clearTimeout(autoStatusTimer);
   showAuthOverlay();
   toast('已退出');
 }
@@ -243,7 +253,13 @@ function logoutAuth(){
 // Check capabilities on load
 function checkCapabilities(){
   post("/api/capabilities",{},function(err,res){
-    if(err) return;
+    if(err||!res||res.error){
+      if(!workspaceReady){
+        var statusBadge=document.getElementById('autoStatusBadge');
+        if(statusBadge){statusBadge.textContent='连接失败';statusBadge.title=err||(res&&res.error)||'无法读取服务端配置，请刷新重试'}
+      }
+      return;
+    }
     authRequired=!!res.auth_required;
     authenticated=!!res.authenticated||!authRequired;
     if(authRequired&&!authenticated)showAuthOverlay();
@@ -255,6 +271,7 @@ function checkCapabilities(){
     autoModeAvailable=!!(res&&res.auto_mode);
     if(res&&res.settings)applyAppSettings(res.settings);
     updateAutoAvailability(res&&res.auto_mode_hint);
+    if(authenticated&&!initializeWorkspace(res.workspace_token||''))return;
     if(autoModeAvailable&&authenticated)loadAutoStatus();
     if(res && res.deep_check){
       deepCheckInfo={
@@ -327,8 +344,6 @@ if(isRemote && !window.location.hostname.endsWith('vercel.app')){
   if(saved){
     API_BASE=saved.replace(/\/$/,"");
     document.getElementById("backendUrl").value=API_BASE;
-    checkCapabilities();
-    checkAuthStatus();
   }
 }
 
@@ -349,13 +364,10 @@ function connectBackend(){
     document.getElementById("connStatus").textContent="已连接 ✓";
     document.getElementById("connStatus").style.color="#22c55e";
     toast("后端连接成功");
-    checkCapabilities();
-    checkAuthStatus();
+    // 切换后端后重新初始化，避免旧请求把上一工作区的缓存写进新工作区。
+    window.location.reload();
   });
 }
-
-checkCapabilities();
-checkAuthStatus();
 
 var roundsSelect=document.getElementById("roundsSelect");
 var concurrentInput=document.getElementById("concurrentInput");
@@ -1109,6 +1121,7 @@ function addToRepoByGrade(grade){
 var REPO_KEY='proxy_checker_repo';
 var USER_TOKEN_KEY='proxy_checker_token';
 var REPO_SYNCED_KEY='proxy_checker_synced';
+var REPO_CLEARED_KEY='repo_manually_cleared';
 var repoCache=null;
 var userTokenCache=null;
 
@@ -1158,6 +1171,7 @@ function compactRepo(repo){
 }
 
 function getUserToken(){
+  if(serverWorkspaceToken)return serverWorkspaceToken;
   if(userTokenCache)return userTokenCache;
   var t='';
   try{t=localStorage.getItem(USER_TOKEN_KEY)||''}catch(e){}
@@ -1167,6 +1181,48 @@ function getUserToken(){
   }
   userTokenCache=t;
   return t;
+}
+
+function initializeWorkspace(fixedToken){
+  var identity=API_BASE+'|'+fixedToken;
+  if(initializedWorkspace!==null){
+    if(initializedWorkspace!==identity){window.location.reload();return false}
+    workspaceReady=true;
+    return true;
+  }
+  serverWorkspaceToken=fixedToken;
+  // 固定身份使用独立缓存，避免新窗口原有的仓库/检测历史误写入指定身份。
+  // 仅当浏览器原本就是该身份时，才复制旧格式缓存；原缓存保留，切回旧模式仍可用。
+  var previousToken='';
+  var migrateLegacy=false;
+  var migrationKey='proxy_checker_cache_migrated:'+fixedToken;
+  try{
+    previousToken=localStorage.getItem(USER_TOKEN_KEY)||'';
+    migrateLegacy=!!fixedToken&&previousToken===fixedToken&&localStorage.getItem(migrationKey)!=='1';
+  }catch(e){}
+  function cacheKey(base){
+    if(!fixedToken)return base;
+    var key=base+':'+fixedToken;
+    if(migrateLegacy){
+      try{
+        var old=localStorage.getItem(base);
+        if(old!==null&&localStorage.getItem(key)===null)localStorage.setItem(key,old);
+      }catch(e){}
+    }
+    return key;
+  }
+  REPO_KEY=cacheKey('proxy_checker_repo');
+  REPO_SYNCED_KEY=cacheKey('proxy_checker_synced');
+  REPO_CLEARED_KEY=cacheKey('repo_manually_cleared');
+  CHECKED_KEY=cacheKey('proxy_checker_checked');
+  RESULTS_KEY=cacheKey('proxy_checker_results');
+  ACTIVE_SESSION_KEY=cacheKey('proxy_checker_active_session');
+  if(migrateLegacy){try{localStorage.setItem(migrationKey,'1')}catch(e){}}
+  repoCache=null;
+  initializedWorkspace=identity;
+  workspaceReady=true;
+  restoreWorkspaceData();
+  return true;
 }
 
 // ============================================================
@@ -1765,7 +1821,7 @@ function syncRepoReplace(repo,baseCount,callback){
 }
 
 function markRepoManuallyCleared(){
-  try{localStorage.setItem('repo_manually_cleared','1')}catch(e){}
+  try{localStorage.setItem(REPO_CLEARED_KEY,'1')}catch(e){}
 }
 
 function loadRepoFromServer(callback,options){
@@ -1797,12 +1853,18 @@ function loadRepoFromServer(callback,options){
         var lines=text.split('\n').filter(function(l){return l.trim()});
         var repo=lines.map(function(p){return {proxy:p,grade:'?',latency:null,ip:null,country:null,ip_type:null,service_reachable:null,api_reachable:null,cf_bypass:false,recommended_use:'generic',target_profile:'generic',target_name:'常规代理检测',added:Date.now()}});
         cb(repo.length,repo);
-      }else{cb(0)}
+      }else if(xhr.status===404){cb(0)}
+      else{cb(0,null,'读取失败')}
     };
-    xhr.onerror=function(){cb(0)};
+    xhr.onerror=function(){cb(0,null,'网络错误')};
     xhr.send();
   }
-  tryLoadJson(token,function(count,repo){
+  tryLoadJson(token,function(count,repo,err){
+    if(err){
+      toast('云端仓库读取失败，保留本地缓存');
+      if(callback)callback(0);
+      return;
+    }
     if(count>0){
           saveRepo(repo,{sync:false});
           rememberRepoSync(count);
@@ -2027,7 +2089,7 @@ function resultToRepoItem(r){
 
 function addRepoItems(items){
   if(!items.length)return {added:0,updated:0};
-  try{localStorage.removeItem('repo_manually_cleared')}catch(e){}
+  try{localStorage.removeItem(REPO_CLEARED_KEY)}catch(e){}
   var repo=loadRepo();
   var indexByProxy={};
   repo.forEach(function(p,i){indexByProxy[p.proxy]=i});
@@ -2195,7 +2257,7 @@ function restoreRepoFromCloud(){
   renderRepo();
   loadRepoFromServer(function(count){
     if(count>0){
-      try{localStorage.removeItem('repo_manually_cleared')}catch(e){}
+      try{localStorage.removeItem(REPO_CLEARED_KEY)}catch(e){}
       toast('已从云端恢复 '+count+' 个代理');
     }else{
       markRepoManuallyCleared();
@@ -2271,7 +2333,7 @@ function updateCloudRepoCount(){
 function saveRepoToCloud(){
   if(!requireAuthenticatedUI())return;
   document.getElementById('repoCloudDropdown').classList.remove('open');
-  try{localStorage.removeItem('repo_manually_cleared')}catch(e){}
+  try{localStorage.removeItem(REPO_CLEARED_KEY)}catch(e){}
   var repo=loadRepo();
   if(!repo.length){toast('仓库为空，无需保存');return}
   var token=getUserToken();
@@ -2316,7 +2378,7 @@ function clearRepo(){
 }
 
 function importRepoTxt(input){
-  try{localStorage.removeItem('repo_manually_cleared')}catch(e){}
+  try{localStorage.removeItem(REPO_CLEARED_KEY)}catch(e){}
   var file=input.files[0];
   if(!file)return;
   var reader=new FileReader();
@@ -2356,7 +2418,7 @@ function exportRepoJson(){
 }
 
 function importRepoJson(input){
-  try{localStorage.removeItem('repo_manually_cleared')}catch(e){}
+  try{localStorage.removeItem(REPO_CLEARED_KEY)}catch(e){}
   var file=input.files[0];
   if(!file)return;
   var reader=new FileReader();
@@ -2391,32 +2453,32 @@ function importRepoJson(input){
   reader.readAsText(file);
 }
 
-// Initial render
-renderRepo();
-// Load checked proxies from server
-loadCheckedLocal();
-updateSkipBadge();
-loadCheckedFromServer(function(count){
-  if(count>0){updateSkipBadge();toast('从服务器恢复 '+count+' 条检测记录')}
-});
-// If repo is empty, try loading from server (skip if user manually cleared)
-var repoClearedManually=localStorage.getItem('repo_manually_cleared');
-if(!repoClearedManually && !loadRepo().length){
-  loadRepoFromServer(function(count){
-    if(count>0){toast('从服务器恢复 '+count+' 个仓库代理')}
+// 先获得已登录的服务端身份，再恢复缓存、仓库和任务，不能与 capabilities 请求抢跑。
+function restoreWorkspaceData(){
+  renderRepo();
+  loadCheckedLocal();
+  updateSkipBadge();
+  loadCheckedFromServer(function(count){
+    if(count>0){updateSkipBadge();toast('从服务器恢复 '+count+' 条检测记录')}
   });
-}
-// Restore saved detection results
-if(loadSavedResults()){
-  var all=V.concat(U).concat(F);
-  if(all.length>0){
-    resetResultRenderLimits('results');
-    renderResultLists();
-    updateStats();
-    statusText.textContent="已恢复 "+all.length+" 条历史结果";
+  var repoClearedManually=localStorage.getItem(REPO_CLEARED_KEY);
+  if(serverWorkspaceToken||(!repoClearedManually&&!loadRepo().length)){
+    // 单人工作区以服务端为准，即使本地有旧缓存也刷新，空仓库同样可以同步。
+    loadRepoFromServer(function(count){
+      if(count>0){toast('从服务器恢复 '+count+' 个仓库代理')}
+    },{replaceEmpty:!!serverWorkspaceToken});
   }
+  if(loadSavedResults()){
+    var all=V.concat(U).concat(F);
+    if(all.length>0){
+      resetResultRenderLimits('results');
+      renderResultLists();
+      updateStats();
+      statusText.textContent="已恢复 "+all.length+" 条历史结果";
+    }
+  }
+  restoreActiveSession();
 }
-restoreActiveSession();
 
 // Get repo link — sync to server and show URL
 function getRepoLink(button){
@@ -2496,6 +2558,7 @@ function initFetchMenu(){
     document.getElementById('fetchBtn').style.display='inline-flex';
   });
 }
+checkCapabilities();
 initFetchMenu();
 
 function toggleFetchMenu(){

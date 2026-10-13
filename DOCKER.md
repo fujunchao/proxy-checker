@@ -1,4 +1,4 @@
-# Docker 部署指南（Proxy Checker v6.6）
+# Docker 部署指南（Proxy Checker v6.6.1）
 
 本文档说明如何把 Proxy Checker 打包成镜像、在 Debian 服务器上部署、以及常见问题的排查方式。
 
@@ -70,7 +70,7 @@ node --version || echo "no node on host（不需要，Node 装在镜像里）"
 | `.gitattributes` | 对 `*.sh` 与 `Dockerfile` 强制 LF，避免 Windows 编辑后 CRLF 破坏 shebang |
 | `.github/workflows/docker.yml` | 可选：打 tag 时自动构建并推送 `linux/amd64,linux/arm64` 多架构镜像到 GHCR |
 
-对源码的改动只有 **1 行**（`server.py:23-24`）：
+运行期配置文件通过 `CONFIG_LOCAL_PATH` 指向挂载卷：
 
 ```python
 # 容器化部署时可用 CONFIG_LOCAL_PATH 把运行期配置指向挂载卷；不设置则保持原有行为（源码目录旁）。
@@ -99,13 +99,38 @@ docker compose logs -f
 
 浏览器打开 `http://<服务器IP>:8888`，用 `.env` 里的密码登录。
 
+### 单人使用：固定身份
+
+只有自己使用时，在服务器的 `.env` 中设置 `WORKSPACE_TOKEN`，并保留现有密码、卷挂载和其他配置：
+
+```dotenv
+WORKSPACE_TOKEN=user_你的原数据标识
+```
+
+上面的值是占位说明，需替换为真实 token（仅英文字母、数字、下划线）。已有数据时，从原浏览器的仓库链接 `/api/repo/<token>.json` 或 `data/auto_data/<token>.json` 文件名取得原 token。**不要另取一个新名字，否则会选中空工作区。** 全新部署可以用随机标识，例如 `python -c "import secrets; print('user_' + secrets.token_hex(16))"` 生成。
+
+更新源码后重建容器（仅 `restart` 不会应用新增环境变量）：
+
+```bash
+docker compose up -d --build --force-recreate
+```
+
+- 所有浏览器登录后自动读取这一身份，无需手动修改浏览器存储。
+- 原仓库、检测记录、自动任务和日志直接沿用，订阅链接不变；不复制、不删除其他身份的数据。
+- 仅调度选定身份，之前其他窗口产生的自动计划不会继续重复执行。取消固定身份后，其他保留的计划会重新参与调度。
+- “我的仓库”和后台任务是服务端数据；历史“有效/失效代理”明细仍是浏览器缓存，不会因为固定身份就自动跨设备恢复全部历史结果。
+- token 不写入公开源码，仅在通过登录校验后下发；公开订阅链接仍按原 token 读取。未登录请求不能通过任意 token 访问固定仓库。
+- 留空恢复原来的浏览器隔离模式。直接运行 Python 可设置同名环境变量，或在 `config.local.json` 中配置 `"workspace_token": "原token"`；修改后需重启服务。
+
+使用纯 `docker run` 时添加 `-e WORKSPACE_TOKEN='原token'`，同样需要重建容器并沿用原 `/data` 挂载。
+
 ### 方式 B：纯 docker 命令
 
 ```bash
 git clone https://github.com/strongshuai/proxy-checker.git
 cd proxy-checker
 
-docker build -t proxy-checker:6.6 .
+docker build -t proxy-checker:6.6.1 .
 
 mkdir -p data
 docker run -d \
@@ -118,7 +143,7 @@ docker run -d \
   -e PUID=1000 -e PGID=1000 \
   -v "$PWD/data:/data" \
   --ulimit nofile=65535:65535 \
-  proxy-checker:6.6
+  proxy-checker:6.6.1
 ```
 
 ### 方式 C：使用 CI 预构建镜像（免去服务器上编译）
@@ -126,7 +151,7 @@ docker run -d \
 把 `.github/workflows/docker.yml` 推上去之后，打标签即触发多架构构建：
 
 ```bash
-git tag v6.6 && git push origin v6.6
+git tag v6.6.1 && git push origin v6.6.1
 ```
 
 服务器上直接拉取（镜像默认是 private，需要先在 Packages 页面设为 Public，或先 `docker login ghcr.io`）：
@@ -165,6 +190,7 @@ docker run -d --name proxy-checker --restart unless-stopped \
 | `AUTH_PASSWORD` | `auth_password` | `linux.do` | 登录密码，**公网必须改**；留空则关闭鉴权 |
 | `AUTH_SESSION_DAYS` | `auth_session_days` | `7` | 登录有效期（天） |
 | `AUTH_SESSION_SECRET` | `auth_session_secret` | 同密码 | 签名密钥；默认跟随密码，改密码即让所有旧 token 失效 |
+| `WORKSPACE_TOKEN` | `workspace_token` | 空 | 单人固定身份；填已有 token 可沿用数据，留空维持浏览器隔离 |
 | `APP_TIMEZONE` | `timezone` | `UTC` | 自动任务计划时区（如 `Asia/Shanghai`） |
 | `CHECK_ROUNDS` | `check_rounds` | `2` | 默认检测轮次 |
 | `MAX_CHECK_ROUNDS` | `max_check_rounds` | `3` | 页面可选的最大轮次 |

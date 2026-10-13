@@ -24,6 +24,7 @@ run_logs/
 data/
 
 outputs/
+artifacts/
 work/
 node_modules/
 .vercel/

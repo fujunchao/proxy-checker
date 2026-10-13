@@ -142,6 +142,13 @@ AUTH_COOKIE_NAME = "proxy_checker_auth"
 AUTH_SESSION_SECONDS = max(1, AUTH_SESSION_DAYS) * 86400
 AUTH_SESSION_SECRET = str(get_config_value("auth_session_secret", "AUTH_SESSION_SECRET", AUTH_PASSWORD))
 APP_TIMEZONE = str(get_config_value("timezone", "APP_TIMEZONE", "UTC"))
+# 单人部署可绑定已有的数据身份；留空仍按浏览器 token 隔离。
+# 不能静默回退到 default，否则配置拼写错误会看起来像数据丢失。
+WORKSPACE_TOKEN = str(get_config_value("workspace_token", "WORKSPACE_TOKEN", "") or "").strip()
+if WORKSPACE_TOKEN and not (
+    WORKSPACE_TOKEN.isascii() and WORKSPACE_TOKEN.replace("_", "").isalnum()
+):
+    raise ValueError("WORKSPACE_TOKEN 只能包含英文字母、数字和下划线")
 MAX_CHECK_ROUNDS = max(1, min(10, MAX_CHECK_ROUNDS))
 CHECK_ROUNDS = max(1, min(MAX_CHECK_ROUNDS, CHECK_ROUNDS))
 RUN_LOG_LIMIT = max(20, min(1000, RUN_LOG_LIMIT))
@@ -936,6 +943,9 @@ threading.Thread(target=cleanup_sessions, daemon=True).start()
 # Auto Mode Scheduler
 # ============================================================
 def list_auto_tokens():
+    # 固定身份模式只调度选定的工作区，不删除其他身份的旧配置或数据。
+    if WORKSPACE_TOKEN:
+        return [WORKSPACE_TOKEN] if os.path.isfile(auto_json_path(WORKSPACE_TOKEN)) else []
     tokens = []
     if not os.path.isdir(AUTO_DIR):
         return tokens
@@ -1839,6 +1849,11 @@ class Handler(SimpleHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
 
+            # 服务端决定写入/查询的身份，旧页面或其他浏览器传来的随机 token 也统一处理。
+            # 公开 GET 订阅链接仍按 URL 中的 token 读取，不能让任意链接映射到私有仓库。
+            if WORKSPACE_TOKEN and is_request_authenticated(self.headers):
+                body["token"] = WORKSPACE_TOKEN
+
             if self.path == "/api/auth/status":
                 self._json(200, {
                     "authenticated": is_request_authenticated(self.headers),
@@ -1874,6 +1889,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "auth_required": is_auth_enabled(),
                     "authenticated": is_request_authenticated(self.headers),
                     "auto_mode": True,
+                    "workspace_token": WORKSPACE_TOKEN if is_request_authenticated(self.headers) else None,
                     "auto_mode_hint": "后台自动任务仅在自托管 Python 服务中可用",
                     "settings": public_settings_payload(),
                     "proxy_sources": [{"id": s["id"], "name": s["name"]} for s in (PROXY_SOURCES if FETCH_PROXIES_AVAILABLE else [])],

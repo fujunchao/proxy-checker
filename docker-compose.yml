@@ -13,7 +13,7 @@ services:
       args:
         # 设为 "0" 可去掉 Node.js 让镜像更小，代价是 ProxyNova 源无法解析
         WITH_NODE: "1"
-    image: proxy-checker:6.6
+    image: proxy-checker:6.6.1
     container_name: proxy-checker
     restart: unless-stopped
 
@@ -28,6 +28,10 @@ services:
       # --- 鉴权（公网部署务必修改）---
       AUTH_PASSWORD: "${AUTH_PASSWORD:-linux.do}"
       AUTH_SESSION_DAYS: "${AUTH_SESSION_DAYS:-7}"
+
+      # --- 单人固定身份：填已有 token 可直接沿用仓库、日志和自动任务 ---
+      # 留空保留原来的多浏览器身份隔离；不要把私人 token 写进这个公开文件。
+      WORKSPACE_TOKEN: "${WORKSPACE_TOKEN:-}"
 
       # --- 检测默认值 ---
       # 注意：这里设了就相当于「钉死」，网页「设置」弹窗里的修改在容器重启后会被环境变量覆盖回去。

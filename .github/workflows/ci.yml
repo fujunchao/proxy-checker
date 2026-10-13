@@ -1,0 +1,104 @@
+name: tests
+
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: 后端、前端和完整冒烟测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUN_FULL_SMOKE: '1'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 安装依赖
+        run: python -m pip install -r requirements.txt tzdata
+      - name: 语法与前端回归
+        run: |
+          mkdir -p artifacts
+          python -m py_compile server.py proxy_check.py tools/test_workspace.py tools/smoke.py
+          node --check app.js
+          node tools/test_workspace_frontend.js 2>&1 | tee artifacts/frontend.log
+      - name: 仓库策略和 Z.AI 回归
+        run: |
+          python tools/test_repo_policy.py 2>&1 | tee artifacts/repo-policy.log
+          python tools/test_zai_profile.py 2>&1 | tee artifacts/zai-profile.log
+      - name: 固定身份、重启持久化及两种模式完整冒烟
+        run: python tools/test_workspace.py 2>&1 | tee artifacts/workspace.log
+      - name: 保存测试日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-logs
+          path: artifacts/
+
+  container:
+    name: Docker 冒烟（${{ matrix.mode }}）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [isolated, fixed]
+    env:
+      WORKSPACE_TOKEN: ${{ matrix.mode == 'fixed' && 'user_ci_fixed' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: docker/setup-buildx-action@v3
+      - name: 构建待测试镜像（不发布）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: proxy-checker:ci
+          cache-from: type=gha,scope=smoke-${{ matrix.mode }}
+          cache-to: type=gha,mode=max,scope=smoke-${{ matrix.mode }}
+      - name: 启动真实容器
+        run: |
+          docker run -d --name proxy-checker-smoke \
+            -p 127.0.0.1:8888:8888 \
+            -e AUTH_PASSWORD=ci-smoke-password \
+            -e WORKSPACE_TOKEN="$WORKSPACE_TOKEN" \
+            proxy-checker:ci
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8888/ >/dev/null; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+      - name: 完整容器冒烟测试
+        run: |
+          mkdir -p artifacts
+          python tools/smoke.py --base-url http://127.0.0.1:8888 \
+            --password ci-smoke-password --expected-workspace-token "$WORKSPACE_TOKEN" \
+            2>&1 | tee artifacts/smoke.log
+      - name: 收集容器日志
+        if: always()
+        run: |
+          mkdir -p artifacts
+          docker logs proxy-checker-smoke >artifacts/container.log 2>&1 || true
+          docker rm -f proxy-checker-smoke || true
+      - name: 保存容器测试日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-logs-${{ matrix.mode }}
+          path: artifacts/

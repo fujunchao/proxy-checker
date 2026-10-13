@@ -91,6 +91,7 @@ def wait_for_result(base_url: str, session_id: str, token: str) -> Dict[str, Any
 
 
 def check_profile(base_url: str, profile_id: str, token: str) -> None:
+    print(f"检查检测档位: {profile_id}", flush=True)
     started = post_json(
         base_url,
         "/api/start",
@@ -112,6 +113,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--password", default=os.environ.get("AUTH_PASSWORD", "linux.do"))
+    parser.add_argument("--expected-workspace-token", default=None,
+                        help="CI 校验固定身份；传空字符串校验浏览器隔离模式")
     args = parser.parse_args()
 
     capabilities = post_json(args.base_url, "/api/capabilities", {})
@@ -140,6 +143,13 @@ def main() -> None:
         raise AssertionError("unauthenticated index.html should not return the main app shell")
 
     token = login(args.base_url, args.password)
+
+    if args.expected_workspace_token is not None:
+        private_capabilities = post_json(args.base_url, "/api/capabilities", {}, token=token)
+        if (private_capabilities.get("workspace_token") or "") != args.expected_workspace_token:
+            raise AssertionError("服务端下发的数据身份与部署配置不一致")
+        if auth_required and capabilities.get("workspace_token"):
+            raise AssertionError("未登录的能力接口不应暴露固定身份")
 
     app_js = get_text(args.base_url, "/app.js", token=token)
     index_html = get_text(args.base_url, "/index.html", token=token)
@@ -192,6 +202,7 @@ def main() -> None:
     elif auto_status.get("auto_mode") is not False:
         raise AssertionError(f"serverless auto status should be unsupported: {auto_status}")
 
+    print("检查默认检测流程", flush=True)
     default_started = post_json(args.base_url, "/api/start", {"proxies": [SMOKE_PROXY], "rounds": 1}, token=token)
     if default_started.get("target_profile") != "generic":
         raise AssertionError(f"default profile is not generic: {default_started}")
