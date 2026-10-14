@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import functools
 import uuid
+from contextlib import contextmanager
 from repository import Repository, RepositoryError, endpoint
 from maintenance import FairBudget, IncrementalBatch, check_batches, choose_batch
 from fetch_proxies import fetch_maintenance_source
@@ -171,9 +172,31 @@ check_engine = ProxyCheckEngine(
 
 sessions = {}
 sessions_lock = threading.Lock()
+manual_starting = set()
 auto_runtime = {}
 auto_stopped_results = {}
 auto_lock = threading.Lock()
+auto_starting = set()
+
+
+@contextmanager
+def reserve_task_slot(registry, starting, lock, key, limit):
+    """只在全局注册锁中预留名额；慢磁盘／网络工作在锁外，异常必归还。"""
+    with lock:
+        reserved = key not in registry and key not in starting and len(set(registry) | starting) < limit
+        if reserved:
+            starting.add(key)
+    try:
+        yield reserved
+    except BaseException:
+        if reserved:
+            with lock:
+                registry.pop(key, None)
+        raise
+    finally:
+        if reserved:
+            with lock:
+                starting.discard(key)
 AUTO_LOCKS = [threading.RLock() for _ in range(64)]
 
 def auto_workspace_lock(token):
@@ -478,7 +501,7 @@ def save_repo_payload(token, incoming, mode="merge", base_count=None, base_revis
 
 
 def truthy_param(value):
-    return endpoint(value) in ("1", "true", "yes", "on")
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def proto_of(proxy):
@@ -1336,7 +1359,8 @@ def finalize_auto_run(token, runtime, status, error=None, repo_summary=None):
         stored = auto_runtime.get(token)
         if stored and stored.get("run_id") == runtime.get("run_id"):
             stored["finished"] = True
-            del auto_runtime[token]
+            with auto_lock:
+                del auto_runtime[token]
     finish_run_log(token, runtime.get("log_id") or runtime.get("run_id"), {
         **summary,
         "type": "auto",
@@ -1360,23 +1384,37 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
     if state.get("profile") != profile:
         state = {"profile": profile}
     # 上次进程终止时仅恢复候选，废弃旧观测；已提交项会被存量键过滤，不重放成功。
+    def queue_retry(inputs):
+        retry = normalize_proxy_list(state.get("retry_candidates", []) + inputs)
+        if len(retry) > 50000:
+            raise RepositoryError("发现重试队列达到 50000 条，请调整批次预算后处理；在途输入已保留")
+        state["retry_candidates"] = retry
+
     if state.get("inflight_type") == "discover":
         rest = state.get("candidates", [])[state.get("cursor", 0):]
-        state.update(candidates=normalize_proxy_list(rest + state.get("inflight_inputs", [])), cursor=0)
+        if state.get("inflight_queue"):
+            state.update(candidates=rest, cursor=0)
+            queue_retry(state.get("inflight_inputs", []))
+        else:
+            # 兼容首版的单队列断点，不遗漏升级前的在途候选。
+            state.update(candidates=normalize_proxy_list(rest + state.get("inflight_inputs", [])), cursor=0)
     state.pop("inflight_type", None)
     state.pop("inflight_inputs", None)
-    work_type, proxies, info = choose_batch(store.snapshot(), state, config, clock())
+    state.pop("inflight_queue", None)
+    selection_snapshot = store.snapshot()
+    work_type, proxies, info = choose_batch(selection_snapshot, state, config, clock())
     update_auto_runtime(token, work_type=work_type, **info, **store.summary())
     log.info("maintenance batch workspace=%s run=%s type=%s due=%s pending=%s",
              hashlib.sha256(token.encode()).hexdigest()[:10], runtime["run_id"], work_type,
              info["due_count"], info["discovery_pending"])
 
     async def run():
-        nonlocal proxies
+        nonlocal proxies, selection_snapshot
+        retry_turn = work_type == "discover" and state.get("discovery_retry_turn") and bool(state.get("retry_candidates"))
         if work_type == "discover":
-            candidates = state.get("candidates", [])
-            cursor = state.get("cursor", 0)
-            if cursor >= len(candidates):
+            candidates = state.get("retry_candidates", []) if retry_turn else state.get("candidates", [])
+            cursor = 0 if retry_turn else state.get("cursor", 0)
+            if not retry_turn and cursor >= len(candidates):
                 update_auto_runtime(token, stage="fetching")
                 index = state.get("source_index", 0)
                 state["source_index"] = index + 1
@@ -1402,40 +1440,62 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
                 return {}, []
             end = min(len(candidates), cursor + config["discover_batch"])
             proxies = candidates[cursor:end]
-            state["cursor"] = end
-            snapshot = await asyncio.to_thread(store.snapshot)
+            if retry_turn:
+                state["retry_candidates"] = candidates[end:]
+            else:
+                state["cursor"] = end
+            selection_snapshot = await asyncio.to_thread(store.snapshot)
             # 存量只由 refresh 管理；缺档位和其他档位不因发现同址而被迁移。
-            existing_keys = {proxy_key(i["proxy"]) for i in snapshot["items"]}
+            existing_keys = {proxy_key(i["proxy"]) for i in selection_snapshot["items"]}
             checked = set(map(proxy_key, read_checked_list(token))) if config["detect_mode"] == "skip" else set()
             before = len(proxies)
             proxies = [p for p in proxies if proxy_key(p) not in checked and proxy_key(p) not in existing_keys]
-            update_auto_runtime(token, skipped=before - len(proxies), discovery_pending=len(candidates) - end,
+            state["discovery_retry_turn"] = not retry_turn
+            update_auto_runtime(token, skipped=before - len(proxies),
+                                discovery_pending=len(candidates) - end + (0 if retry_turn else len(state.get("retry_candidates", []))),
                                 source_count=len(candidates))
         if runtime["stop"].is_set():
             return {}, []
         # 先存游标及在途输入：进程退出后不重放内存成功观测，输入回到有界队尾。
-        state.update(inflight_type=work_type, inflight_inputs=proxies)
+        state.update(inflight_type=work_type, inflight_inputs=proxies,
+                     inflight_queue="retry" if retry_turn else "source")
         await asyncio.to_thread(store.maintenance, state)
         update_auto_runtime(token, total=len(proxies), input_count=len(proxies), stage="detecting")
         if not proxies:
             runtime["next_delay"] = 5
             return {}, []
         context = await asyncio.to_thread(store.begin, runtime["run_id"], profile,
-                                          runtime.get("config_generation", 0), proxies)
+                                          runtime.get("config_generation", 0), proxies, snapshot=selection_snapshot)
+        if context is None:
+            state.pop("inflight_type", None)
+            state.pop("inflight_inputs", None)
+            state.pop("inflight_queue", None)
+            await asyncio.to_thread(store.maintenance, state)
+            update_auto_runtime(token, conflict_skipped=len(proxies), incomplete_count=len(proxies))
+            return {"conflict_skipped": len(proxies), "incomplete_count": len(proxies)}, []
         try:
             batch = IncrementalBatch(store, engine, network_budget, token, config, context, runtime["stop"],
                                      make_observation, lambda r: publish_auto_result(token, r),
                                      lambda **s: update_auto_runtime(token, **s), clock=timer_clock)
             summary, completed = await batch.run(proxies)
+            complete_keys = set(map(proxy_key, completed))
+            unfinished = [p for p in proxies if proxy_key(p) not in complete_keys]
             if work_type == "discover":
-                complete_keys = set(map(proxy_key, completed))
-                unfinished = [p for p in proxies if proxy_key(p) not in complete_keys]
-                # 消费的前缀回收空间，未完成项轮转；候选数量不会增加。
-                rest = state.get("candidates", [])[state.get("cursor", 0):]
-                state.update(candidates=rest + unfinished, cursor=0)
+                # 来源向前消费，慢项进入独立有界队列；重试批次和来源批次交替。
+                if not retry_turn:
+                    rest = state.get("candidates", [])[state.get("cursor", 0):]
+                    state.update(candidates=rest, cursor=0)
+                queue_retry(unfinished)
+            else:
+                retry = state.setdefault("retry_after", {})
+                for proxy in completed:
+                    retry.pop(proxy_key(proxy), None)
+                for proxy in unfinished:
+                    retry[proxy_key(proxy)] = clock() + min(60, config["refresh_seconds"])
             if not runtime["stop"].is_set():
                 state.pop("inflight_type", None)
                 state.pop("inflight_inputs", None)
+                state.pop("inflight_queue", None)
                 await asyncio.to_thread(store.maintenance, state)
                 # 批次末重新统计真实到期情况，轮询只计算年龄，不扫描大结果集。
                 _, _, after = choose_batch(store.snapshot(), dict(state), config, clock())
@@ -1474,7 +1534,8 @@ def execute_auto_run(token, config, run_id, reason):
         source_proxies = normalize_proxy_list(fetched)
 
         update_auto_runtime(token, stage="loading_repo", source_count=len(source_proxies))
-        repo = read_repo_data(token)
+        repo_snapshot = repo_store(token).snapshot()
+        repo = RepoView(repo_snapshot)
         repo_proxies = normalize_proxy_list(item.get("proxy") for item in repo)
         combined = normalize_proxy_list(source_proxies + repo_proxies)
 
@@ -1499,7 +1560,11 @@ def execute_auto_run(token, config, run_id, reason):
             })
         update_auto_runtime(token, stage="detecting", repo_count=len(repo), total=len(to_check), skipped=skipped)
 
-        context = repo_store(token).begin(run_id, config["target_profile"], runtime.get("config_generation", 0), to_check)
+        context = repo_store(token).begin(run_id, config["target_profile"], runtime.get("config_generation", 0),
+                                         to_check, snapshot=repo_snapshot)
+        if context is None:
+            finalize_auto_run(token, runtime, "completed", repo_summary={"conflict_skipped": len(to_check), **repo_store(token).summary()})
+            return
         if to_check:
             async def run_async():
                 await check_batches(check_engine, network_budget, token,
@@ -1578,11 +1643,17 @@ def publish_auto_result(token, result):
 
 def start_auto_run(token, reason="schedule"):
     token = sanitize_token(token)
+    with reserve_task_slot(auto_runtime, auto_starting, auto_lock, token, 16) as reserved:
+        if not reserved:
+            return False, "自动任务正在执行或进程维护工作区已达 16 个"
+        return _start_reserved_auto_run(token, reason)
+
+
+def _start_reserved_auto_run(token, reason):
+    token = sanitize_token(token)
     with auto_workspace_lock(token):
         if token in auto_runtime:
             return False, "自动任务正在执行"
-        if len(auto_runtime) >= 16:
-            return False, "进程维护工作区上限为 16，等待下一次调度"
         repo_store(token).summary()  # 损坏仓库不能启动自动写入。
         record = load_auto_record(token)
         config = normalize_auto_config(record.get("config", {}))
@@ -1633,7 +1704,8 @@ def start_auto_run(token, reason="schedule"):
             "daily_time": config["daily_time"],
             "timezone": config["timezone"],
         }
-        auto_runtime[token] = runtime
+        with auto_lock:
+            auto_runtime[token] = runtime
         auto_stopped_results.pop(token, None)
         state = record["state"]
         state["maintenance_paused"] = False
@@ -1864,6 +1936,32 @@ def run_deep_check(proxy_str, target_url=None, token="default"):
 # ============================================================
 # Main Check Runner
 # ============================================================
+def start_manual_run(token, proxies, rounds, target_profile, max_concurrent):
+    if not isinstance(proxies, list) or len(proxies) > 50000:
+        return 429, {"error": "每次最多 50000 条代理"}
+    if is_auto_running(token):
+        return 200, {"error": "自动任务正在执行，请先停止自动任务", "auto_running": True}
+    sid = "manual_" + uuid.uuid4().hex
+    with reserve_task_slot(sessions, manual_starting, sessions_lock, sid, 32) as reserved:
+        if not reserved:
+            return 429, {"error": "最多保留 32 个手动任务，请稍后重试"}
+        log_id = start_run_log(token, {
+            "id": sid, "type": "manual", "status": "running", "session_id": sid,
+            "started_at": int(time.time()), "target_profile": target_profile,
+            "target_name": get_target_profile_name(target_profile), "rounds": rounds,
+            "max_concurrent": max_concurrent, "total": len(proxies), "timezone": APP_TIMEZONE})
+        with sessions_lock:
+            sessions[sid] = {"results": [], "done": 0, "finished": False, "stop": None,
+                             "total": len(proxies), "created": time.time(), "rounds": rounds,
+                             "target_profile": target_profile, "max_concurrent": max_concurrent,
+                             "token": token, "log_id": log_id}
+        threading.Thread(target=run_check, args=(sid, proxies, rounds, target_profile, max_concurrent, token), daemon=True).start()
+        log.info("manual start run=%s total=%s rounds=%s profile=%s concurrency=%s",
+                 sid, len(proxies), rounds, target_profile, max_concurrent)
+        return 200, {"session_id": sid, "total": len(proxies), "rounds": rounds,
+                     "target_profile": target_profile, "max_concurrent": max_concurrent}
+
+
 def run_check(session_id, proxies, rounds=None, target_profile=None, max_concurrent=None, token="default"):
     if rounds is None:
         rounds = CHECK_ROUNDS
@@ -2098,42 +2196,12 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(200, {"ok": True, **run_logs_payload(token)})
 
             elif self.path == "/api/start":
-                proxies = body.get("proxies", [])
-                if not isinstance(proxies, list) or len(proxies) > 50000 or len(sessions) >= 32:
-                    self._json(429, {"error": "每次最多 50000 条，最多保留 32 个手动任务，请稍后重试"})
-                    return
-                rounds = normalize_rounds(body.get("rounds", CHECK_ROUNDS))
-                target_profile = normalize_target_profile(body.get("target_profile", "generic"))
-                max_concurrent = normalize_max_concurrent(body.get("max_concurrent", MAX_CONCURRENT))
-                token = sanitize_token(body.get("token", ""))
-                if body.get("token") and is_auto_running(token):
-                    self._json(200, {"error": "自动任务正在执行，请先停止自动任务", "auto_running": True})
-                    return
-                sid = str(time.time()) + str(id(proxies))
-                log_id = start_run_log(token, {
-                    "id": sid,
-                    "type": "manual",
-                    "status": "running",
-                    "session_id": sid,
-                    "started_at": int(time.time()),
-                    "target_profile": target_profile,
-                    "target_name": get_target_profile_name(target_profile),
-                    "rounds": rounds,
-                    "max_concurrent": max_concurrent,
-                    "total": len(proxies),
-                    "timezone": APP_TIMEZONE,
-                })
-                with sessions_lock:
-                    sessions[sid] = {
-                        "results": [], "done": 0, "finished": False,
-                        "stop": None, "total": len(proxies), "created": time.time(),
-                        "rounds": rounds, "target_profile": target_profile,
-                        "max_concurrent": max_concurrent, "token": token,
-                        "log_id": log_id,
-                    }
-                threading.Thread(target=run_check, args=(sid, proxies, rounds, target_profile, max_concurrent, token), daemon=True).start()
-                log.info(f"Start check: session={sid}, proxies={len(proxies)}, rounds={rounds}, target_profile={target_profile}, max_concurrent={max_concurrent}")
-                self._json(200, {"session_id": sid, "total": len(proxies), "rounds": rounds, "target_profile": target_profile, "max_concurrent": max_concurrent})
+                code, response = start_manual_run(
+                    sanitize_token(body.get("token", "")), body.get("proxies", []),
+                    normalize_rounds(body.get("rounds", CHECK_ROUNDS)),
+                    normalize_target_profile(body.get("target_profile", "generic")),
+                    normalize_max_concurrent(body.get("max_concurrent", MAX_CONCURRENT)))
+                self._json(code, response)
 
             elif self.path == "/api/status":
                 sid = body.get("session_id", "")

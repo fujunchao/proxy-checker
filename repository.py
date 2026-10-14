@@ -180,9 +180,13 @@ class Repository:
                                    "current_count": len(current), "submitted_count": len(incoming),
                                    "repo_revision": data["revision"]}
 
-    def begin(self, run_id, profile, config_generation, inputs):
+    def begin(self, run_id, profile, config_generation, inputs, snapshot=None):
         with self.lock:
             data = self.snapshot()
+            # 选批和登记必须来自同一读取代次，不能给旧候选补发人工修改后的新 epoch。
+            if snapshot is not None and (snapshot["epoch"] != data["epoch"] or any(
+                    snapshot["versions"].get(endpoint(p)) != data["versions"].get(endpoint(p)) for p in inputs)):
+                return None
             # 重启后的在途收据不重放；旧实例不能在新进程中恢复发布。
             data["runs"] = {k: v for k, v in data["runs"].items() if v["boot"] == BOOT_ID}
             if run_id in data["runs"] or len(data["runs"]) >= 8 or len(inputs) > MAX_OBSERVATIONS:

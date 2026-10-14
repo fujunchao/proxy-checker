@@ -187,16 +187,24 @@ def choose_batch(snapshot, state, config, now):
     due = [i for i in rows if not i.get("last_checked_at") or now - i["last_checked_at"] / 1000 >= interval]
     due.sort(key=lambda i: (i.get("last_checked_at", 0), endpoint(i["proxy"])))
     eligible = [i for i in due if endpoint(i["proxy"]) not in retry]
+    # 一轮内只尝试同一存量一次，不能因长批次让选批时的退避过期而反复占据前缀。
+    seen = set(state.get("refresh_seen", [])) & keys
+    untried = [i for i in eligible if endpoint(i["proxy"]) not in seen]
+    if not untried and eligible:
+        seen.clear()
+        untried = eligible
     known = [i["last_checked_at"] / 1000 for i in rows if i.get("last_checked_at")]
     info = {"due_count": len(due), "unknown_age_count": len(rows) - len(known),
             "oldest_checked_at": min(known) if known else None,
             "migration_required": sum(1 for i in snapshot["items"] if not i.get("target_profile")),
             "other_profile_count": sum(1 for i in snapshot["items"] if i.get("target_profile") not in (None, profile)),
-            "discovery_pending": max(0, len(state.get("candidates", [])) - state.get("cursor", 0))}
-    if eligible and state.get("refresh_streak", 0) < config["refresh_share"]:
-        selected = [i["proxy"] for i in eligible[:config["refresh_batch"]]]
+            "discovery_pending": max(0, len(state.get("candidates", [])) - state.get("cursor", 0)) + len(state.get("retry_candidates", []))}
+    if untried and state.get("refresh_streak", 0) < config["refresh_share"]:
+        selected = [i["proxy"] for i in untried[:config["refresh_batch"]]]
         for p in selected:
             retry[endpoint(p)] = now + min(60, interval)
+        seen.update(map(endpoint, selected))
+        state["refresh_seen"] = sorted(seen)
         state["refresh_streak"] = state.get("refresh_streak", 0) + 1
         return "refresh", selected, info
     state["refresh_streak"] = 0

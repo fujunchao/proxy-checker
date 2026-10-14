@@ -144,10 +144,6 @@ function dedup(){
   toast("去重: "+lines.length+" -> "+unique.length+" 个");
 }
 function post(url,data,cb,timeout){
-  if(url==='/api/repo/save'&&data.base_revision===undefined){
-    var revision=readRepoSyncMeta().revision;
-    if(typeof revision==='number')data.base_revision=revision;
-  }
   var fullUrl=API_BASE+url;
   var xhr=new XMLHttpRequest();xhr.open("POST",fullUrl,true);
   xhr.timeout=timeout||0;
@@ -1169,7 +1165,7 @@ var REPO_KEY='proxy_checker_repo';
 var USER_TOKEN_KEY='proxy_checker_token';
 var REPO_SYNCED_KEY='proxy_checker_synced';
 var REPO_CLEARED_KEY='repo_manually_cleared';
-var repoCache=null;
+var repoCache=null,repoCacheRevision=null,repoCacheGeneration=0;
 var userTokenCache=null;
 
 function readRepoSyncMeta(){
@@ -1182,9 +1178,23 @@ function rememberRepoSync(count,revision){
 }
 
 function getRepoBaseCount(repo){
-  var meta=readRepoSyncMeta();
-  if(typeof meta.count==='number'&&meta.count>=0)return meta.count;
   return compactRepo(repo||loadRepo()).length;
+}
+
+function saveRepoRequest(repo,mode,baseCount,callback){
+  loadRepo();
+  var revision=repoCacheRevision,generation=repoCacheGeneration,identity=workspaceEpoch;
+  var submitted=compactRepo(repo);
+  var payload={repo:submitted,token:getUserToken(),mode:mode,base_count:baseCount,base_revision:revision};
+  post('/api/repo/save',payload,function(err,res){
+    if(identity!==workspaceEpoch)return;
+    if(!err&&res&&res.ok&&generation===repoCacheGeneration&&
+       (revision!==null||res.current_count===0)&&res.count===submitted.length&&
+       JSON.stringify(compactRepo(repoCache))===JSON.stringify(submitted)){
+      saveRepo(submitted,{sync:false,revision:res.repo_revision});
+    }
+    callback(err,res);
+  });
 }
 
 function compactRepoItem(p){
@@ -1270,7 +1280,7 @@ function initializeWorkspace(fixedToken){
   RESULTS_KEY=cacheKey('proxy_checker_results');
   ACTIVE_SESSION_KEY=cacheKey('proxy_checker_active_session');
   if(migrateLegacy){try{localStorage.setItem(migrationKey,'1')}catch(e){}}
-  repoCache=null;
+  repoCache=null;repoCacheRevision=null;repoCacheGeneration++;
   initializedWorkspace=identity;
   workspaceReady=true;
   restoreWorkspaceData();
@@ -1466,7 +1476,7 @@ function acceptAutoStatus(data){
   autoSummaryEpoch++;
   autoSummaryLoading=false;
   var revision=data.state&&data.state.repo_revision;
-  if(typeof revision==='number'&&revision!==readRepoSyncMeta().revision){
+  if(typeof revision==='number'&&revision!==repoCacheRevision){
     loadRepoFromServer(null,{replaceEmpty:true});
   }
   if(Object.prototype.hasOwnProperty.call(data,'results_session_id')){
@@ -1939,7 +1949,7 @@ function syncRepoToServer(repoOverride){
   if(!requireAuthenticatedUI())return;
   var repo=compactRepo(repoOverride||loadRepo());
   var token=getUserToken();
-  post('/api/repo/save',{repo:repo,token:token,mode:'merge',base_count:getRepoBaseCount(repo)},function(err,res){
+  saveRepoRequest(repo,'merge',getRepoBaseCount(repo),function(err,res){
     if(res&&res.stale_repo){
       toast(res.error||'云端仓库已更新，正在刷新');
       loadRepoFromServer();
@@ -1955,11 +1965,11 @@ function syncRepoToServer(repoOverride){
 function syncRepoReplace(repo,baseCount,callback){
   if(!requireAuthenticatedUI())return;
   repo=compactRepo(repo);
-  post('/api/repo/save',{repo:repo,token:getUserToken(),mode:'replace',base_count:baseCount},function(err,res){
+  saveRepoRequest(repo,'replace',baseCount,function(err,res){
     if(err){if(callback)callback(err);return}
     if(res&&res.stale_repo){
       toast(res.error||'云端仓库已更新，正在刷新');
-      loadRepoFromServer(function(){if(callback)callback(null,res)});
+      loadRepoFromServer(function(){if(callback)callback(null,res)},{replaceEmpty:true});
       return;
     }
     if(res&&res.ok)rememberRepoSync(res.count,res.repo_revision);
@@ -1972,12 +1982,11 @@ function markRepoManuallyCleared(){
 }
 
 function loadRepoFromServer(callback,options){
-  options=options||{};
+  options=Object.assign({replaceEmpty:true},options||{});
   var token=getUserToken(),identityEpoch=workspaceEpoch;
-  function readRevision(xhr,count){
-    if(!xhr.getResponseHeader)return;
-    var header=xhr.getResponseHeader('X-Repo-Revision');
-    if(header!==null&&header!=='')rememberRepoSync(count,Number(header));
+  function readRevision(xhr){
+    var header=xhr.getResponseHeader?xhr.getResponseHeader('X-Repo-Revision'):null;
+    return header!==null&&header!==''&&Number.isFinite(Number(header))?Number(header):null;
   }
   function tryLoadJson(t,cb){
     var xhr=new XMLHttpRequest();
@@ -1987,8 +1996,8 @@ function loadRepoFromServer(callback,options){
       if(xhr.status===200){
         try{
           var data=JSON.parse(xhr.responseText);
-          if(Array.isArray(data))readRevision(xhr,data.length);
-          if(Array.isArray(data)&&data.length>0){cb(data.length,data);return}
+          var revision=readRevision(xhr);
+          if(Array.isArray(data)&&(data.length>0||revision!==null)){cb(data.length,data,null,revision);return}
         }catch(e){}
         // Fallback to txt
         tryLoadTxt(t,cb);
@@ -2004,17 +2013,17 @@ function loadRepoFromServer(callback,options){
     xhr.onload=function(){
       if(xhr.status===200){
         var text=xhr.responseText.trim();
-        if(!text){cb(0);return}
+        if(!text){cb(0,[],null,readRevision(xhr));return}
         var lines=text.split('\n').filter(function(l){return l.trim()});
         var repo=lines.map(function(p){return {proxy:p,grade:'?',latency:null,ip:null,country:null,ip_type:null,service_reachable:null,api_reachable:null,cf_bypass:false,recommended_use:'generic',target_profile:'generic',target_name:'常规代理检测',added:Date.now()}});
-        cb(repo.length,repo);
+        cb(repo.length,repo,null,readRevision(xhr));
       }else if(xhr.status===404){cb(0)}
       else{cb(0,null,'读取失败')}
     };
     xhr.onerror=function(){cb(0,null,'网络错误')};
     xhr.send();
   }
-  tryLoadJson(token,function(count,repo,err){
+  tryLoadJson(token,function(count,repo,err,revision){
     if(identityEpoch!==workspaceEpoch||token!==getUserToken()||!authenticated)return;
     if(err){
       toast('云端仓库读取失败，保留本地缓存');
@@ -2022,15 +2031,15 @@ function loadRepoFromServer(callback,options){
       return;
     }
     if(count>0){
-          saveRepo(repo,{sync:false});
-          rememberRepoSync(count);
+          saveRepo(repo,{sync:false,revision:revision});
+          rememberRepoSync(count,revision);
           updateCloudRepoCount();
           renderRepo();
           if(callback)callback(count);
     }else{
       if(options.replaceEmpty){
-        saveRepo([],{sync:false});
-        rememberRepoSync(0);
+        saveRepo([],{sync:false,revision:revision});
+        rememberRepoSync(0,revision);
         renderRepo();
         if(callback)callback(0);
         return;
@@ -2041,7 +2050,7 @@ function loadRepoFromServer(callback,options){
       }
       tryLoadJson('default',function(count2,repo2){
         if(count2>0){
-          saveRepo(repo2,{sync:false});
+          saveRepo(repo2,{sync:false,revision:null});
           rememberRepoSync(count2);
           updateCloudRepoCount();
           renderRepo();
@@ -2061,16 +2070,26 @@ var checkedSyncTimer=null;
 var checkedIncremental=false,checkedPending=new Set(),checkedSyncBusy=false;
 var checkedClearPending=false,checkedClearVersion=0,checkedLocalTimer=null;
 
+function persistCheckedSync(){
+  try{localStorage.setItem(CHECKED_KEY+':pending',JSON.stringify({pending:Array.from(checkedPending),
+      clear:checkedClearPending,version:checkedClearVersion}))}catch(e){}
+}
 function loadCheckedLocal(){
   try{
+    var sync=JSON.parse(localStorage.getItem(CHECKED_KEY+':pending'))||{};
+    checkedPending=new Set(Array.isArray(sync.pending)?sync.pending:[]);
+    checkedClearPending=sync.clear===true;
+    checkedClearVersion=Number(sync.version)||0;
     var arr=JSON.parse(localStorage.getItem(CHECKED_KEY))||[];
-    checkedProxies=new Set(arr);
+    checkedProxies=new Set(checkedClearPending?checkedPending:arr);
+    checkedPending.forEach(function(p){checkedProxies.add(p)});
   }catch(e){checkedProxies=new Set()}
 }
 function saveCheckedLocal(){
   if(checkedLocalTimer)return;
   checkedLocalTimer=setTimeout(function(){
     checkedLocalTimer=null;
+    persistCheckedSync();
     try{localStorage.setItem(CHECKED_KEY,JSON.stringify([...checkedProxies]))}catch(e){}
   },3000);
 }
@@ -2087,6 +2106,7 @@ function syncCheckedToServer(delay){
       if(!err&&res&&res.ok&&version===checkedClearVersion){
         if(clearing)checkedClearPending=false;
         else arr.forEach(function(p){checkedPending.delete(p)});
+        persistCheckedSync();
       }
       if(checkedClearPending||checkedPending.size)syncCheckedToServer(err||!res||!res.ok?5000:100);
     },30000);
@@ -2100,9 +2120,15 @@ function loadCheckedFromServer(callback){
   xhr.onload=function(){
     if(version!==checkedClearVersion){if(callback)callback(0);return}
     if(xhr.status===200){
-      var lines=xhr.responseText.split('\n').filter(function(l){return l.trim()});
-      lines.forEach(function(l){checkedProxies.add(l.trim())});
+      var lines=xhr.responseText.split('\n').map(function(l){return l.trim()}).filter(Boolean);
+      if(!checkedClearPending){
+        var confirmed=new Set(lines);
+        checkedProxies.forEach(function(p){if(!confirmed.has(p))checkedPending.add(p)});
+        lines.forEach(function(p){checkedProxies.add(p);checkedPending.delete(p)});
+      }
+      persistCheckedSync();
       saveCheckedLocal();
+      if(checkedClearPending||checkedPending.size)syncCheckedToServer();
       if(callback)callback(lines.length);
     }else{if(callback)callback(0)}
   };
@@ -2155,6 +2181,7 @@ function clearCheckedHistory(){
   checkedPending.clear();
   checkedClearVersion++;
   checkedClearPending=true;
+  persistCheckedSync();
   saveCheckedLocal();
   syncCheckedToServer();
   updateSkipBadge();
@@ -2203,6 +2230,8 @@ function fallbackResultsCache(key,value){
 function saveResultsNow(){
   clearTimeout(resultsSaveTimer);resultsSaveTimer=null;
   var key=RESULTS_KEY,revision=resultsCacheRevision;
+  var marker=null;
+  try{marker=localStorage.getItem(key)}catch(e){}
   var value={valid:V.slice(),unstable:U.slice(),invalid:F.slice()};
   withResultsDB(function(db){
     if(key!==RESULTS_KEY||revision!==resultsCacheRevision)return;
@@ -2210,11 +2239,14 @@ function saveResultsNow(){
     try{
       var tx=db.transaction('results','readwrite');
       tx.objectStore('results').put(value,API_BASE+'|'+key);
-      tx.oncomplete=function(){try{localStorage.removeItem(key)}catch(e){}};
+      tx.oncomplete=function(){
+        if(key!==RESULTS_KEY||revision!==resultsCacheRevision)return;
+        try{if(localStorage.getItem(key)===marker)localStorage.removeItem(key)}catch(e){}
+      };
       tx.onabort=tx.onerror=function(){
         if(key===RESULTS_KEY&&revision===resultsCacheRevision)fallbackResultsCache(key,value);
       };
-    }catch(e){fallbackResultsCache(key,value)}
+    }catch(e){if(key===RESULTS_KEY&&revision===resultsCacheRevision)fallbackResultsCache(key,value)}
   });
 }
 function saveResults(){
@@ -2226,7 +2258,8 @@ function clearResultsCache(){
   clearTimeout(resultsSaveTimer);resultsSaveTimer=null;
   var key=RESULTS_KEY;
   // 小型空快照也是持久化清空标记：即使 IndexedDB 删除失败，刷新也不能恢复旧结果。
-  try{localStorage.setItem(key,'{"valid":[],"unstable":[],"invalid":[]}')}catch(e){}
+  try{localStorage.setItem(key,JSON.stringify({valid:[],unstable:[],invalid:[],
+      cleared_generation:Date.now()+'_'+Math.random()}))}catch(e){}
   withResultsDB(function(db){
     if(db){try{db.transaction('results','readwrite').objectStore('results').delete(API_BASE+'|'+key)}catch(e){}}
   });
@@ -2296,28 +2329,40 @@ function restoreActiveSession(){
 function loadRepo(){
   if(repoCache)return repoCache;
   try{
-    repoCache=compactRepo(JSON.parse(localStorage.getItem(REPO_KEY))||[]);
-    return repoCache;
-  }catch(e){
-    repoCache=[];
-    return repoCache;
-  }
+    var snapshot=JSON.parse(localStorage.getItem(REPO_KEY+':snapshot'));
+    if(snapshot&&Array.isArray(snapshot.repo)){
+      repoCache=compactRepo(snapshot.repo);
+      repoCacheRevision=typeof snapshot.revision==='number'?snapshot.revision:null;
+    }else{
+      repoCache=compactRepo(JSON.parse(localStorage.getItem(REPO_KEY))||[]);
+      // 旧格式内容和元信息不是原子一对，不能把共享版本附给旧内容。
+      repoCacheRevision=null;
+    }
+  }catch(e){repoCache=[];repoCacheRevision=null;}
+  repoCacheGeneration++;
+  return repoCache;
 }
 function saveRepo(repo,options){
   options=options||{};
+  if(Object.prototype.hasOwnProperty.call(options,'revision')){
+    repoCacheRevision=typeof options.revision==='number'?options.revision:null;
+  }
   repoCache=compactRepo(repo);
+  repoCacheGeneration++;
   var json=JSON.stringify(repoCache);
   var localSaved=false;
   try{
+    localStorage.setItem(REPO_KEY+':snapshot',JSON.stringify({repo:repoCache,revision:repoCacheRevision}));
     localStorage.setItem(REPO_KEY,json);
     localSaved=true;
   }catch(e){
     try{
       localStorage.removeItem(RESULTS_KEY);
+      localStorage.setItem(REPO_KEY+':snapshot',JSON.stringify({repo:repoCache,revision:repoCacheRevision}));
       localStorage.setItem(REPO_KEY,json);
       localSaved=true;
     }catch(e2){
-      try{localStorage.removeItem(REPO_KEY)}catch(e3){}
+      try{localStorage.removeItem(REPO_KEY);localStorage.removeItem(REPO_KEY+':snapshot')}catch(e3){}
       if(!saveRepo._quotaWarned){
         toast('仓库太大，本地缓存已跳过，仍会同步到云端');
         saveRepo._quotaWarned=true;
@@ -2602,7 +2647,7 @@ function saveRepoToCloud(){
   var repo=loadRepo();
   if(!repo.length){toast('仓库为空，无需保存');return}
   var token=getUserToken();
-  post('/api/repo/save',{repo:repo,token:token,mode:'merge',base_count:getRepoBaseCount(repo)},function(err,res){
+  saveRepoRequest(repo,'merge',getRepoBaseCount(repo),function(err,res){
     if(err){toast('保存失败: '+err);return}
     if(res&&res.stale_repo){
       toast(res.error||'云端仓库已更新，正在刷新');
@@ -2758,7 +2803,7 @@ function getRepoLink(button){
     btn.innerHTML='&#128279; 同步中...';
     btn.disabled=true;
   }
-  post('/api/repo/save',{repo:repo,token:token,mode:'merge',base_count:getRepoBaseCount(repo)},function(err,res){
+  saveRepoRequest(repo,'merge',getRepoBaseCount(repo),function(err,res){
     if(btn){
       btn.innerHTML='&#128279; 仓库链接';
       btn.disabled=false;
