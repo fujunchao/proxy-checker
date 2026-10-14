@@ -2232,21 +2232,25 @@ function saveResultsNow(){
   var key=RESULTS_KEY,revision=resultsCacheRevision;
   var marker=null;
   try{marker=localStorage.getItem(key)}catch(e){}
+  function currentWrite(){
+    if(key!==RESULTS_KEY||revision!==resultsCacheRevision)return false;
+    try{return localStorage.getItem(key)===marker}catch(e){return false}
+  }
   var value={valid:V.slice(),unstable:U.slice(),invalid:F.slice()};
   withResultsDB(function(db){
-    if(key!==RESULTS_KEY||revision!==resultsCacheRevision)return;
+    if(!currentWrite())return;
     if(!db){fallbackResultsCache(key,value);return}
     try{
       var tx=db.transaction('results','readwrite');
       tx.objectStore('results').put(value,API_BASE+'|'+key);
       tx.oncomplete=function(){
-        if(key!==RESULTS_KEY||revision!==resultsCacheRevision)return;
-        try{if(localStorage.getItem(key)===marker)localStorage.removeItem(key)}catch(e){}
+        if(!currentWrite())return;
+        try{localStorage.removeItem(key)}catch(e){}
       };
       tx.onabort=tx.onerror=function(){
-        if(key===RESULTS_KEY&&revision===resultsCacheRevision)fallbackResultsCache(key,value);
+        if(currentWrite())fallbackResultsCache(key,value);
       };
-    }catch(e){if(key===RESULTS_KEY&&revision===resultsCacheRevision)fallbackResultsCache(key,value)}
+    }catch(e){if(currentWrite())fallbackResultsCache(key,value)}
   });
 }
 function saveResults(){
