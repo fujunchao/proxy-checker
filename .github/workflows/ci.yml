@@ -44,12 +44,14 @@ jobs:
           node tools/test_workspace_frontend.js 2>&1 | tee artifacts/frontend.log
           node tools/test_result_performance.js 2>&1 | tee artifacts/result-performance.log
           node tools/test_auto_loading.js 2>&1 | tee artifacts/auto-loading.log
+          node tools/test_maintenance_frontend.js 2>&1 | tee artifacts/maintenance-frontend.log
           node tools/test_frontend_pipeline.js 2>&1 | tee artifacts/frontend-pipeline.log
           node tools/test_cache_dom.js 2>&1 | tee artifacts/cache-dom.log
           python tools/test_performance_api.py 2>&1 | tee artifacts/performance-api.log
       - name: 仓库策略和 Z.AI 回归
         run: |
           python tools/test_maintenance.py 2>&1 | tee artifacts/maintenance.log
+          python tools/test_maintenance_api.py 2>&1 | tee artifacts/maintenance-api.log
           python tools/test_repo_policy.py 2>&1 | tee artifacts/repo-policy.log
           python tools/test_zai_profile.py 2>&1 | tee artifacts/zai-profile.log
       - name: 固定身份、重启持久化及两种模式完整冒烟

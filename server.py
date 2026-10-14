@@ -1248,6 +1248,8 @@ def merge_repo_results(token, repo, results, checked_inputs, policy):
 def make_observation(context, result, index):
     detail = result_summary(result)
     complete = result.get("terminal_complete") is True
+    if "rounds_completed" in detail and detail["rounds_completed"] != result.get("checks_total"):
+        complete = False
     return {"observation_id": str(index), "run_id": context["run_id"],
             "started_at": result.get("started_at", context["started_at"]),
             "completed_at": result.get("completed_at", int(time.time() * 1000)),
@@ -1566,6 +1568,11 @@ def publish_auto_result(token, result):
             runtime["counts"][2] += int(not result.get("valid") and not result.get("unstable"))
         runtime["done"] = runtime.get("done", 0) + 1
         runtime["last_progress_at"] = time.time()
+        if runtime["last_progress_at"] - runtime.get("last_progress_log_at", 0) >= 10:
+            runtime["last_progress_log_at"] = runtime["last_progress_at"]
+            log.info("maintenance progress workspace=%s run=%s stage=%s done=%s total=%s",
+                     hashlib.sha256(token.encode()).hexdigest()[:10], runtime.get("run_id"),
+                     runtime.get("stage"), runtime["done"], runtime.get("total", 0))
 
 
 def start_auto_run(token, reason="schedule"):
@@ -1835,16 +1842,19 @@ async def deep_check_nodriver(proxy_str, target_url, timeout=20):
             except Exception:
                 pass
 
-def run_deep_check(proxy_str, target_url=None):
+def run_deep_check(proxy_str, target_url=None, token="default"):
     """Synchronous wrapper for deep check."""
     if not NODRIVER_AVAILABLE:
         return {"error": "nodriver not installed", "success": False}
 
     target = target_url or TARGET_CHAT
+    async def bounded():
+        async with network_budget.lease(token, 1, threading.Event()):
+            return await asyncio.wait_for(deep_check_nodriver(proxy_str, target, timeout=20), timeout=30)
     loop = asyncio.new_event_loop()
     try:
         ok, details = loop.run_until_complete(
-            deep_check_nodriver(proxy_str, target, timeout=20)
+            bounded()
         )
         return {"success": ok, **details}
     finally:
@@ -2209,7 +2219,7 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json(200, {"success": False, "error": "nodriver not installed", "hint": "pip install nodriver"})
                     return
                 target = body.get("target", TARGET_CHAT)
-                result = run_deep_check(proxy, target)
+                result = run_deep_check(proxy, target, sanitize_token(body.get("token", "default")))
                 self._json(200, result)
 
             elif self.path == "/api/repo/save":
@@ -2249,7 +2259,10 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 source_id = body.get("source", "proxifly")
                 limit = min(int(body.get("limit", 999999)), 999999)
-                proxies, source_name, err = fetch_proxies(source_id, limit)
+                async def bounded_fetch():
+                    async with network_budget.lease(sanitize_token(body.get("token", "default")), 1, threading.Event()):
+                        return await asyncio.to_thread(fetch_proxies, source_id, limit)
+                proxies, source_name, err = asyncio.run(bounded_fetch())
                 if err:
                     self._json(200, {"error": err, "source": source_name})
                 else:

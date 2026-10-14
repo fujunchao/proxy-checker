@@ -60,7 +60,6 @@ class RepositoryRegression(unittest.TestCase):
 
     def test_manual_clear_and_modify_fence_inflight(self):
         for replacement in ([], [item(1, country="JP")], [item(2)]):
-            store = self.store(str(len(replacement)) + str(replacement))
             # 使用独立合成身份，不能让 sanitize 把非法名称合并。
             store = self.store("edit_" + str(abs(hash(str(replacement)))))
             store.save([item(1)], "replace", 0)
@@ -156,6 +155,41 @@ class RepositoryRegression(unittest.TestCase):
         self.assertEqual(store.snapshot()["txt"], "http://192.0.2.8:80\n")
         store.finish(context["run_id"])
         self.assertEqual(store.snapshot()["json"], raw)
+
+    def test_cancel_configuration_generation_and_protocol_identity(self):
+        store = self.store()
+        context = self.context(store)
+        wrong_generation = {**context, "config_generation": 2}
+        self.assertEqual(store.publish(wrong_generation, [self.observation(context)], "archive_all")["conflict_skipped"], 1)
+        store.fence()
+        self.assertEqual(store.publish(context, [self.observation(context)], "archive_all")["conflict_skipped"], 1)
+        context = self.context(store, run="new", inputs=["socks5://192.0.2.1:8080"])
+        store.publish(context, [self.observation(context)], "archive_all")
+        self.assertEqual(store.snapshot()["items"], [])
+
+    def test_manual_save_preserves_measurement_and_streak(self):
+        store = self.store()
+        context = self.context(store)
+        store.publish(context, [self.observation(context)], "stable_only")
+        store.save([item(1, last_ok=90000, pass_streak=99, country="SG")], "replace", store.summary()["repo_revision"])
+        row = store.snapshot()["items"][0]
+        self.assertEqual((row["last_ok"], row["pass_streak"]), (2000, 1))
+
+    def test_receipt_capacity_never_discards_required_protection(self):
+        store = self.store()
+        context = self.context(store, [item(1)["proxy"], item(2)["proxy"]])
+        with patch("repository.MAX_OBSERVATIONS", 1):
+            store.publish(context, [self.observation(context)], "stable_only")
+            with self.assertRaises(server.RepositoryError):
+                store.publish(context, [self.observation(context, n=2, oid="second")], "stable_only")
+        self.assertEqual(store.snapshot()["items"][0]["pass_streak"], 1)
+
+    def test_parallel_manual_adds_are_serialized_without_lost_rows(self):
+        import concurrent.futures
+        store = self.store()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda n: store.save([item(n)], "merge"), range(1, 9)))
+        self.assertEqual(len(store.snapshot()["items"]), 8)
 
 
 class CoordinatorRegression(unittest.TestCase):
@@ -260,6 +294,139 @@ class CoordinatorRegression(unittest.TestCase):
         self.assertEqual(cfg["maintenance_mode"], "legacy")
         self.assertEqual(cfg["detect_mode"], "skip")
         self.assertFalse(cfg["enabled"])
+
+    def test_restart_recovers_inputs_without_replaying_success(self):
+        token = "restart_inputs"
+        store = server.repo_store(token)
+        store.save([item(1, last_checked_at=2000)], "replace", 0)
+        store.maintenance({"profile": "generic", "candidates": [item(1)["proxy"], item(2)["proxy"], item(3)["proxy"]],
+                           "cursor": 2, "inflight_type": "discover", "inflight_inputs": [item(1)["proxy"], item(2)["proxy"]]})
+        seen = []
+        class Engine:
+            async def check_many_async(self, proxies, stop_event, rounds, max_concurrent, on_result, target_profile):
+                seen.extend(proxies)
+                for p in proxies:
+                    await on_result({**item(2), "proxy": p, "original": p, "terminal_complete": True,
+                                     "started_at": 3000, "completed_at": 4000})
+        def source(*_):
+            raise AssertionError("恢复时不应重新抓源")
+        runtime = {"run_id": "recovered", "stop": threading.Event(), "results": [], "counts": [0, 0, 0]}
+        server.auto_runtime[token] = runtime
+        server.execute_maintenance_run(token, self.config(), runtime, engine=Engine(), source=source, clock=lambda: 3)
+        self.assertEqual(seen, [item(3)["proxy"], item(2)["proxy"]])
+        self.assertNotIn("pass_streak", store.snapshot()["items"][0])
+        self.assertNotIn("inflight_inputs", store.maintenance())
+        server.auto_runtime.pop(token)
+
+    def test_source_byte_and_candidate_limits(self):
+        import io
+        import fetch_proxies
+        for content in (b"x" * (4 * 1024 * 1024 + 1),
+                        "\n".join(f"192.0.2.1:{i}" for i in range(10000, 60001)).encode()):
+            with patch.object(fetch_proxies, "PROXY_SOURCES", [{"id": "synthetic", "parser": "plain", "url": "http://example.invalid"}]), \
+                    patch("urllib.request.urlopen", return_value=io.BytesIO(content)):
+                with self.assertRaises(RuntimeError):
+                    fetch_proxies.fetch_maintenance_source(0, threading.Event())
+
+    def test_budget_interrupt_publishes_completed_not_fake_failures(self):
+        from maintenance import IncrementalBatch, FairBudget
+        store = server.repo_store("budget_interrupt")
+        store.save([item(1), item(2)], "replace", 0)
+        context = store.begin("budget", "generic", 1, [item(1)["proxy"], item(2)["proxy"]])
+        now = [0]
+        class Engine:
+            async def check_many_async(self, proxies, stop_event, rounds, max_concurrent, on_result, target_profile):
+                await on_result(item(1, original=proxies[0], terminal_complete=True, started_at=1000, completed_at=2000))
+                await asyncio.Event().wait()
+        async def tick(_):
+            now[0] += 1
+            await asyncio.sleep(0)
+        batch = IncrementalBatch(store, Engine(), FairBudget(2), "budget_interrupt", self.config(batch_seconds=3),
+                                 context, threading.Event(), server.make_observation, clock=lambda: now[0], wait=tick)
+        result, _ = asyncio.run(batch.run([item(1)["proxy"], item(2)["proxy"]]))
+        self.assertEqual(result["incomplete_count"], 1)
+        self.assertEqual(result["repo_removed"], 0)
+        self.assertEqual(len(store.snapshot()["items"]), 2)
+        self.assertEqual(store.snapshot()["items"][0]["last_ok"], 2000)
+
+    def test_manual_cancel_keeps_committed_and_discards_buffer(self):
+        from maintenance import IncrementalBatch, FairBudget
+        store = server.repo_store("cancel_buffer")
+        context = store.begin("cancel", "generic", 1, [item(1)["proxy"], item(2)["proxy"]])
+        stop = threading.Event()
+        first = asyncio.Event()
+        cfg = self.config(publish_count=1)
+        class Engine:
+            async def check_many_async(self, proxies, stop_event, rounds, max_concurrent, on_result, target_profile):
+                await on_result(item(1, original=proxies[0], terminal_complete=True, started_at=1000, completed_at=2000))
+                await first.wait()
+                cfg["publish_count"] = 20
+                await on_result(item(2, original=proxies[1], terminal_complete=True, started_at=1000, completed_at=2000))
+                stop.set()
+                store.fence()
+        def status(**fields):
+            if fields.get("repo_added"):
+                first.set()
+        batch = IncrementalBatch(store, Engine(), FairBudget(2), "cancel_buffer", cfg, context, stop,
+                                 server.make_observation, on_status=status)
+        asyncio.run(batch.run([item(1)["proxy"], item(2)["proxy"]]))
+        self.assertEqual([i["proxy"] for i in store.snapshot()["items"]], [item(1)["proxy"]])
+
+    def test_engine_half_round_is_not_a_result_and_hard_timeout_is(self):
+        from proxy_check import ProxyCheckEngine, CheckConfig, RoundResult
+        stopped = threading.Event()
+        class HalfRound(ProxyCheckEngine):
+            async def check_once_async(self, *args, **kwargs):
+                stopped.set()
+                return RoundResult(valid=True, service_reachable=True, ip="192.0.2.1")
+        class HardTimeout(ProxyCheckEngine):
+            async def check_proxy_full_async(self, *args, **kwargs):
+                raise asyncio.TimeoutError()
+        results = []
+        asyncio.run(HalfRound(CheckConfig(timeout=1, detect_timeout=1)).check_many_async(
+            [item(1)["proxy"]], stopped, 2, 1, results.append, "generic"))
+        self.assertEqual(results, [])
+        asyncio.run(HardTimeout(CheckConfig(timeout=1, detect_timeout=1)).check_many_async(
+            [item(1)["proxy"]], threading.Event(), 2, 1, results.append, "generic"))
+        self.assertEqual(results[0]["grade"], "F")
+        self.assertTrue(results[0]["terminal_complete"])
+
+    def test_fair_budget_shared_across_manual_and_workspaces(self):
+        from maintenance import FairBudget
+        budget = FairBudget(2)
+        order, active, peak = [], [0], [0]
+        async def worker(workspace, name):
+            for _ in range(2):
+                async with budget.lease(workspace, 2, threading.Event()) as slots:
+                    active[0] += slots
+                    peak[0] = max(peak[0], active[0])
+                    order.append(name)
+                    await asyncio.sleep(0)
+                    active[0] -= slots
+        async def run():
+            await asyncio.gather(worker("one", "refresh"), worker("one", "manual"), worker("two", "discover"))
+        asyncio.run(run())
+        self.assertEqual(peak[0], 2)
+        self.assertEqual(order[:3], ["refresh", "manual", "discover"])
+        self.assertEqual(budget.available, 2)
+
+    def test_source_failure_does_not_clear_or_starve_stock(self):
+        token = "source_failure"
+        store = server.repo_store(token)
+        store.save([item(1)], "replace", 0)
+        store.maintenance({"profile": "generic", "refresh_streak": 4})
+        def source(*_):
+            raise RuntimeError("synthetic secret must not appear in status")
+        runtime = {"run_id": "source_fail", "stop": threading.Event(), "results": [], "counts": [0, 0, 0]}
+        server.auto_runtime[token] = runtime
+        server.execute_maintenance_run(token, self.config(), runtime, source=source)
+        self.assertEqual(len(store.snapshot()["items"]), 1)
+        self.assertNotIn("secret", runtime["source_error"])
+        from maintenance import choose_batch
+        kind, proxies, _ = choose_batch(store.snapshot(), store.maintenance(), self.config(), 2000)
+        self.assertEqual(kind, "refresh")
+        self.assertEqual(proxies, [item(1)["proxy"]])
+        server.auto_runtime.pop(token)
 
 
 if __name__ == "__main__":

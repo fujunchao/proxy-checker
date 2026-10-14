@@ -98,6 +98,8 @@ class IncrementalBatch:
             if combined.is_set() or not result.get("terminal_complete"):
                 return
             obs = self.observation(self.context, result, completed)
+            if not obs["complete"]:
+                return
             completed += 1
             accepted_inputs.append(result.get("original") or result.get("proxy"))
             self.on_result(result)

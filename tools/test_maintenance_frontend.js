@@ -1,0 +1,35 @@
+// 测试真实页面函数，不连接服务器；订阅字段、版本与会话时序必须保持正确。
+const assert = require('node:assert/strict');
+const {browser, bind} = require('./test_workspace_frontend');
+const b = browser();
+bind(b, 'maintenance_ui');
+const w = b.context;
+const read = b.requests.find(r => r.url.endsWith('/api/repo/maintenance_ui.json'));
+read.getResponseHeader = name => name === 'X-Repo-Revision' ? '7' : null;
+b.reply(read, [{proxy: 'http://192.0.2.1:80', usable: false, aux_reachable: {zcode: false},
+  last_ok: 1234, last_checked_at: 2000, pass_streak: 2, target_profile: 'zai'}]);
+assert.equal(w.loadRepo()[0].usable, false);
+assert.equal(w.loadRepo()[0].last_ok, 1234);
+w.syncRepoReplace([], 1);
+assert.equal(b.requests.at(-1).body.base_revision, 7);
+b.reply(b.requests.at(-1), {ok: true, count: 0, repo_revision: 8});
+assert.equal(w.readRepoSyncMeta().revision, 8);
+
+const pending = b.requests.find(r => r.url.endsWith('/api/auto/status'));
+w.acceptAutoStatus({config: {enabled: true, maintenance_mode: 'continuous', target_profile: 'zai', detect_mode: 'skip'},
+  state: {running: true, work_type: 'refresh', done: 1, total: 2, due_count: 9,
+    unknown_age_count: 3, oldest_refresh_age_seconds: 1800, repo_count: 8, repo_revision: 8},
+  results_session_id: 'new-run', results_total: 0});
+assert.match(w.document.getElementById('autoStatusBadge').textContent, /存量复测中/);
+assert.match(w.document.getElementById('autoProgress').innerHTML, /存量到期 9/);
+assert.match(w.document.getElementById('autoProgress').innerHTML, /版本 8/);
+b.reply(pending, {config: {enabled: false}, state: {}, new: []});
+assert.equal(w.autoStatusCache.config.enabled, true, '旧摘要不能覆盖更新的配置响应');
+
+w.logoutAuth();
+const oldState = w.autoStatusCache;
+b.reply(pending, {config: {enabled: false}, state: {}, new: []});
+assert.equal(w.autoStatusCache, oldState, '登出后的旧请求不能更改状态');
+assert.equal(w.autoSessionId, '');
+assert.equal(w.autoPageRequest, null);
+console.log('maintenance frontend ok');
