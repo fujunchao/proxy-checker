@@ -7,7 +7,7 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
 
 function browser(saved = {}) {
-  const storage = new Map(Object.entries(saved));
+  const storage = saved instanceof Map ? saved : new Map(Object.entries(saved));
   const requests = [];
   const elements = new Map();
   const timers = new Map();

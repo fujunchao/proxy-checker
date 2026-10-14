@@ -36,6 +36,14 @@ jobs:
         run: |
           python -m pip install -r requirements.txt tzdata
           npm ci --ignore-scripts
+      - name: 审核交错回归（后端）
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p artifacts
+          python tools/test_audit_backend.py 2>&1 | tee artifacts/audit-backend.log
+      - name: 审核交错回归（前端）
+        if: ${{ !cancelled() }}
+        run: node tools/test_audit_frontend.js 2>&1 | tee artifacts/audit-frontend.log
       - name: 语法与前端回归
         run: |
           mkdir -p artifacts
