@@ -44,6 +44,9 @@ jobs:
       - name: 审核交错回归（前端）
         if: ${{ !cancelled() }}
         run: node tools/test_audit_frontend.js 2>&1 | tee artifacts/audit-frontend.log
+      - name: 发现公平性回归
+        if: ${{ !cancelled() }}
+        run: python tools/test_discovery_fairness.py 2>&1 | tee artifacts/discovery-fairness.log
       - name: 语法与前端回归
         run: |
           mkdir -p artifacts
