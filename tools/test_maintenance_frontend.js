@@ -1,6 +1,7 @@
 // 测试真实页面函数，不连接服务器；订阅字段、版本与会话时序必须保持正确。
 const assert = require('node:assert/strict');
 const {browser, bind} = require('./test_workspace_frontend');
+const {JSDOM} = require('jsdom');
 const b = browser();
 bind(b, 'maintenance_ui');
 const w = b.context;
@@ -16,6 +17,9 @@ b.reply(b.requests.at(-1), {ok: true, count: 0, repo_revision: 8});
 assert.equal(w.readRepoSyncMeta().revision, 8);
 
 const pending = b.requests.find(r => r.url.endsWith('/api/auto/status'));
+// 渲染断言使用真实 DOM 转义语义，不使用仅用于时序测试的简化节点。
+const dom = new JSDOM('<div id="autoProgress"></div><span id="autoStatusBadge"></span>');
+w.document = dom.window.document;
 w.acceptAutoStatus({config: {enabled: true, maintenance_mode: 'continuous', target_profile: 'zai', detect_mode: 'skip'},
   state: {running: true, work_type: 'refresh', done: 1, total: 2, due_count: 9,
     unknown_age_count: 3, oldest_refresh_age_seconds: 1800, repo_count: 8, repo_revision: 8},
@@ -32,4 +36,5 @@ b.reply(pending, {config: {enabled: false}, state: {}, new: []});
 assert.equal(w.autoStatusCache, oldState, '登出后的旧请求不能更改状态');
 assert.equal(w.autoSessionId, '');
 assert.equal(w.autoPageRequest, null);
+dom.window.close();
 console.log('maintenance frontend ok');
