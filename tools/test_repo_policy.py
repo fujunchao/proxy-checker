@@ -20,7 +20,7 @@ import tempfile
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SKIP = shutil.ignore_patterns(
-    ".git", ".workbuddy", "__pycache__", "*.pyc",
+    ".git", ".workbuddy", "__pycache__", "*.pyc", "node_modules", "outputs", "artifacts", "work",
     "repo_data", "checked_data", "auto_data", "run_logs",
     "config.local.json", ".env", "server.log",
 )

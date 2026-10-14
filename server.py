@@ -169,6 +169,8 @@ sessions_lock = threading.Lock()
 auto_runtime = {}
 auto_stopped_results = {}
 auto_lock = threading.Lock()
+checked_lock = threading.RLock()
+AUTO_RESULT_PAGE_SIZE = 1000
 TARGET_PROFILE_IDS = {str(item["id"]) for item in TARGET_PROFILE_OPTIONS}
 # 仓库入库策略。target_only 比 stable_only 更严：只收「对本档目标确实可用」的线路
 # （result.usable，由档位的 required_probes 门禁给出）。集中定义避免多处白名单漂移。
@@ -562,20 +564,23 @@ def read_checked_list(token):
 
 def write_checked_list(token, proxies):
     proxies = normalize_proxy_list(proxies)
-    atomic_write_text(checked_txt_path(token), "\n".join(proxies))
+    with checked_lock:
+        atomic_write_text(checked_txt_path(token), "\n".join(proxies))
     return proxies
 
 
 def append_checked_list(token, proxies):
-    existing = read_checked_list(token)
-    seen = {proxy_key(proxy) for proxy in existing}
-    merged = list(existing)
-    for proxy in normalize_proxy_list(proxies):
-        key = proxy_key(proxy)
-        if key not in seen:
-            seen.add(key)
-            merged.append(proxy)
-    return write_checked_list(token, merged)
+    # 浏览器增量追加与后台完成写入共享锁，重复请求不造成重复或无谓落盘。
+    with checked_lock:
+        existing = read_checked_list(token)
+        seen = {proxy_key(proxy) for proxy in existing}
+        merged = list(existing)
+        for proxy in normalize_proxy_list(proxies):
+            key = proxy_key(proxy)
+            if key not in seen:
+                seen.add(key)
+                merged.append(proxy)
+        return write_checked_list(token, merged) if len(merged) != len(existing) else existing
 
 
 def compact_run_log(entry):
@@ -998,7 +1003,35 @@ def runtime_counts(results):
     return valid, unstable, invalid
 
 
-def get_auto_status(token, since=0, client_session_id=""):
+def retained_auto_results(token):
+    """调用者持有 auto_lock；运行及终态结果共用分页读取路径。"""
+    for key, value in list(auto_stopped_results.items()):
+        if value.get("expires", 0) < time.time():
+            del auto_stopped_results[key]
+    return auto_runtime.get(token) or auto_stopped_results.get(token)
+
+
+def get_auto_result_page(token, session_id, since=0, limit=AUTO_RESULT_PAGE_SIZE):
+    token = sanitize_token(token)
+    with auto_lock:
+        source = retained_auto_results(token)
+        if not source:
+            return 410, {"error": "本轮结果已过期，请刷新任务状态", "expired": True}
+        if session_id != source.get("run_id"):
+            return 409, {"error": "任务已切换，请刷新任务状态", "reset": True}
+        try:
+            since = max(0, int(since))
+            limit = max(1, min(AUTO_RESULT_PAGE_SIZE, int(limit)))
+        except (TypeError, ValueError):
+            return 400, {"error": "分页参数必须是整数"}
+        results = source.get("results", [])
+        since = min(since, len(results))
+        end = min(len(results), since + limit)
+        return 200, {"session_id": session_id, "new": results[since:end],
+                     "results_index": end, "results_total": len(results), "has_more": end < len(results)}
+
+
+def get_auto_status(token, since=0, client_session_id="", summary_only=False):
     token = sanitize_token(token)
     with auto_lock:
         record = load_auto_record(token)
@@ -1006,6 +1039,7 @@ def get_auto_status(token, since=0, client_session_id=""):
         runtime = auto_runtime.get(token)
         new_results = []
         results_index = 0
+        source = retained_auto_results(token)
         if runtime:
             results = runtime.get("results", [])
             try:
@@ -1015,9 +1049,11 @@ def get_auto_status(token, since=0, client_session_id=""):
             if client_session_id and client_session_id != runtime.get("run_id"):
                 since = 0
             since = max(0, min(len(results), since))
-            new_results = results[since:]
+            new_results = [] if summary_only else results[since:]
             results_index = len(results)
-            valid, unstable, invalid = runtime_counts(results)
+            if "counts" not in runtime:
+                runtime["counts"] = list(runtime_counts(results))
+            valid, unstable, invalid = runtime["counts"]
             record["state"].update({
                 "running": True,
                 "status": runtime.get("status", "running"),
@@ -1049,7 +1085,7 @@ def get_auto_status(token, since=0, client_session_id=""):
                 if client_session_id and client_session_id != stopped.get("run_id"):
                     since = 0
                 since = max(0, min(len(results), since))
-                new_results = results[since:]
+                new_results = [] if summary_only else results[since:]
                 results_index = len(results)
         state = record["state"]
         state["next_run_text"] = format_timestamp(state.get("next_run_at"), config.get("timezone"))
@@ -1060,6 +1096,8 @@ def get_auto_status(token, since=0, client_session_id=""):
         record["auto_mode"] = True
         record["new"] = new_results
         record["results_index"] = results_index
+        record["results_session_id"] = source.get("run_id") if source else None
+        record["results_total"] = len(source.get("results", [])) if source else 0
         return record
 
 
@@ -1290,14 +1328,12 @@ def finalize_auto_run(token, runtime, status, error=None, repo_summary=None):
         })
         append_auto_history(state, summary)
         save_auto_record(token, {"config": config, "state": state})
-        if status == "stopped":
-            auto_stopped_results[token] = {
-                "run_id": runtime.get("run_id"),
-                "results": list(runtime.get("results", [])),
-                "expires": time.time() + 900,
-            }
-        else:
-            auto_stopped_results.pop(token, None)
+        # 完成或失败也保留尾页，避免摘要先显示终态后客户端丢掉尚未恢复的结果。
+        auto_stopped_results[token] = {
+            "run_id": runtime.get("run_id"),
+            "results": list(runtime.get("results", [])),
+            "expires": time.time() + 900,
+        }
         stored = auto_runtime.get(token)
         if stored and stored.get("run_id") == runtime.get("run_id"):
             stored["finished"] = True
@@ -1412,6 +1448,10 @@ def publish_auto_result(token, result):
         if not runtime:
             return
         runtime["results"].append(result)
+        if "counts" in runtime:
+            runtime["counts"][0] += int(bool(result.get("valid")))
+            runtime["counts"][1] += int(bool(result.get("unstable")))
+            runtime["counts"][2] += int(not result.get("valid") and not result.get("unstable"))
         runtime["done"] = runtime.get("done", 0) + 1
         runtime["last_progress_at"] = time.time()
 
@@ -1454,6 +1494,7 @@ def start_auto_run(token, reason="schedule"):
             "stage": "starting",
             "started_at": started_at,
             "results": [],
+            "counts": [0, 0, 0],
             "done": 0,
             "total": 0,
             "last_progress_at": started_at,
@@ -1469,6 +1510,7 @@ def start_auto_run(token, reason="schedule"):
             "timezone": config["timezone"],
         }
         auto_runtime[token] = runtime
+        auto_stopped_results.pop(token, None)
         state = record["state"]
         state.update({
             "running": True,
@@ -1889,6 +1931,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "auth_required": is_auth_enabled(),
                     "authenticated": is_request_authenticated(self.headers),
                     "auto_mode": True,
+                    "checked_incremental": True,
                     "workspace_token": WORKSPACE_TOKEN if is_request_authenticated(self.headers) else None,
                     "auto_mode_hint": "后台自动任务仅在自托管 Python 服务中可用",
                     "settings": public_settings_payload(),
@@ -1981,12 +2024,12 @@ class Handler(SimpleHTTPRequestHandler):
 
             elif self.path == "/api/auto/get":
                 token = sanitize_token(body.get("token", "default"))
-                self._json(200, get_auto_status(token, body.get("since", 0), body.get("session_id", "")))
+                self._json(200, get_auto_status(token, body.get("since", 0), body.get("session_id", ""), body.get("summary_only", False)))
 
             elif self.path == "/api/auto/save":
                 token = sanitize_token(body.get("token", "default"))
                 record = save_auto_config(token, body.get("config", {}))
-                response = get_auto_status(token)
+                response = get_auto_status(token, summary_only=body.get("summary_only", False))
                 response["saved"] = True
                 response["config"] = record["config"]
                 response["state"] = record["state"]
@@ -1995,7 +2038,7 @@ class Handler(SimpleHTTPRequestHandler):
             elif self.path == "/api/auto/run-now":
                 token = sanitize_token(body.get("token", "default"))
                 started, message = start_auto_run(token, "manual")
-                response = get_auto_status(token)
+                response = get_auto_status(token, summary_only=body.get("summary_only", False))
                 response["started"] = started
                 if not started:
                     response["error"] = message
@@ -2004,13 +2047,26 @@ class Handler(SimpleHTTPRequestHandler):
             elif self.path == "/api/auto/stop":
                 token = sanitize_token(body.get("token", "default"))
                 stopped = stop_auto_run(token)
-                response = get_auto_status(token, body.get("since", 0), body.get("session_id", ""))
+                response = get_auto_status(token, body.get("since", 0), body.get("session_id", ""), body.get("summary_only", False))
                 response["stopped"] = stopped
                 self._json(200, response)
 
             elif self.path == "/api/auto/status":
                 token = sanitize_token(body.get("token", "default"))
-                self._json(200, get_auto_status(token, body.get("since", 0), body.get("session_id", "")))
+                self._json(200, get_auto_status(token, body.get("since", 0), body.get("session_id", ""), body.get("summary_only", False)))
+
+            elif self.path == "/api/auto/results":
+                code, page = get_auto_result_page(body.get("token", "default"), body.get("session_id", ""),
+                                                  body.get("since", 0), body.get("limit", AUTO_RESULT_PAGE_SIZE))
+                self._json(code, page)
+
+            elif self.path == "/api/checked/append":
+                proxies = body.get("proxies", [])
+                if not isinstance(proxies, list) or len(proxies) > 1000:
+                    self._json(400, {"error": "每次最多追加 1000 条历史"})
+                    return
+                merged = append_checked_list(body.get("token", "default"), proxies)
+                self._json(200, {"ok": True, "count": len(merged)})
 
             elif self.path == "/api/stop":
                 sid = body.get("session_id", "")
@@ -2085,9 +2141,7 @@ class Handler(SimpleHTTPRequestHandler):
                 token = body.get("token", "default")
                 if not token.replace("_","").isalnum():
                     token = "default"
-                checked_file = os.path.join(CHECKED_DIR, f"{token}.txt")
-                with open(checked_file, "w") as f:
-                    f.write("\n".join(proxies))
+                proxies = write_checked_list(token, proxies)
                 log.info(f"Checked proxies saved: token={token}, count={len(proxies)}")
                 self._json(200, {"ok": True, "count": len(proxies)})
 

@@ -28,13 +28,20 @@ jobs:
         with:
           node-version: '22'
       - name: 安装依赖
-        run: python -m pip install -r requirements.txt tzdata
+        run: |
+          python -m pip install -r requirements.txt tzdata
+          npm ci --ignore-scripts
       - name: 语法与前端回归
         run: |
           mkdir -p artifacts
           python -m py_compile server.py proxy_check.py tools/test_workspace.py tools/smoke.py
           node --check app.js
           node tools/test_workspace_frontend.js 2>&1 | tee artifacts/frontend.log
+          node tools/test_result_performance.js 2>&1 | tee artifacts/result-performance.log
+          node tools/test_auto_loading.js 2>&1 | tee artifacts/auto-loading.log
+          node tools/test_frontend_pipeline.js 2>&1 | tee artifacts/frontend-pipeline.log
+          node tools/test_cache_dom.js 2>&1 | tee artifacts/cache-dom.log
+          python tools/test_performance_api.py 2>&1 | tee artifacts/performance-api.log
       - name: 仓库策略和 Z.AI 回归
         run: |
           python tools/test_repo_policy.py 2>&1 | tee artifacts/repo-policy.log

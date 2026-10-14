@@ -32,6 +32,7 @@ class WorkspaceTest(unittest.TestCase):
                      "app.js", "index.html", "login.html"):
             shutil.copy2(ROOT / name, cls.root / name)
         cls.env = patch.dict(os.environ, {"WORKSPACE_TOKEN": FIXED, "AUTH_PASSWORD": "workspace-test",
+                                        "PYTHONIOENCODING": "utf-8",
                                         "LOG_FILE": str(cls.root / "server.log")})
         cls.env.start()
         sys.path.insert(0, str(cls.root))
@@ -150,7 +151,7 @@ class WorkspaceTest(unittest.TestCase):
                 result = subprocess.run(
                     [sys.executable, str(ROOT / "tools" / "smoke.py"), "--base-url", self.base,
                      "--password", "workspace-test", "--expected-workspace-token", token],
-                    capture_output=True, text=True, timeout=180)
+                    capture_output=True, text=True, encoding="utf-8", timeout=180)
                 print(result.stdout, flush=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("smoke ok", result.stdout)

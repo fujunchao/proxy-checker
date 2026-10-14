@@ -10,6 +10,8 @@ function browser(saved = {}) {
   const storage = new Map(Object.entries(saved));
   const requests = [];
   const elements = new Map();
+  const timers = new Map();
+  let nextTimer = 0;
   function element(id = '') {
     if (elements.has(id)) return elements.get(id);
     const node = {value: id === 'roundsSelect' ? '2' : id === 'concurrentInput' ? '30' : '',
@@ -28,7 +30,8 @@ function browser(saved = {}) {
     document: {getElementById: element, createElement: () => element('created'),
       querySelector: element, querySelectorAll: () => [], addEventListener() {}, body: element('body')},
     window: {location: {hostname: 'localhost', origin: 'http://localhost', reload() {throw Error('unexpected reload');}}},
-    setTimeout() {return 1;}, clearTimeout() {}, requestAnimationFrame(fn) {fn();},
+    setTimeout(fn, delay) {const id = ++nextTimer; timers.set(id, {fn, delay}); return id;},
+    clearTimeout(id) {timers.delete(id);}, requestAnimationFrame(fn) {fn();},
     XMLHttpRequest: function () {
       this.open = (method, url) => {this.method = method; this.url = url;};
       this.setRequestHeader = () => {};
@@ -41,7 +44,13 @@ function browser(saved = {}) {
     request.responseText = typeof payload === 'string' ? payload : JSON.stringify(payload);
     request.onload();
   }
-  return {context, storage, requests, reply};
+  function runTimer(id) {
+    const timer = timers.get(id);
+    assert.ok(timer, `定时器 ${id} 不存在`);
+    timers.delete(id);
+    timer.fn();
+  }
+  return {context, storage, requests, reply, timers, runTimer};
 }
 
 function bind(b, token) {
@@ -50,6 +59,9 @@ function bind(b, token) {
   b.reply(cap, {auth_required: true, authenticated: true, auto_mode: true, workspace_token: token});
 }
 
+module.exports = {browser, bind};
+
+if (require.main === module) {
 for (const previous of ['', 'user_another_browser']) {
   const b = browser(previous ? {'proxy_checker_token': previous,
     'proxy_checker_repo': '[{"proxy":"http://wrong-cache:80"}]',
@@ -105,3 +117,4 @@ locked.reply(locked.requests.find(r => r.url.endsWith('/api/capabilities')),
   {auth_required: true, authenticated: false, auto_mode: true});
 assert.equal(locked.requests.filter(r => /\/api\/(repo|checked|auto|logs)[/]/.test(r.url)).length, 0);
 console.log('workspace frontend ok');
+}

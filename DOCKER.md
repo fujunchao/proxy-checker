@@ -1,4 +1,4 @@
-# Docker 部署指南（Proxy Checker v6.6.1）
+# Docker 部署指南（Proxy Checker v6.6.2）
 
 本文档说明如何把 Proxy Checker 打包成镜像、在 Debian 服务器上部署、以及常见问题的排查方式。
 
@@ -130,7 +130,7 @@ docker compose up -d --build --force-recreate
 git clone https://github.com/strongshuai/proxy-checker.git
 cd proxy-checker
 
-docker build -t proxy-checker:6.6.1 .
+docker build -t proxy-checker:6.6.2 .
 
 mkdir -p data
 docker run -d \
@@ -143,7 +143,7 @@ docker run -d \
   -e PUID=1000 -e PGID=1000 \
   -v "$PWD/data:/data" \
   --ulimit nofile=65535:65535 \
-  proxy-checker:6.6.1
+  proxy-checker:6.6.2
 ```
 
 ### 方式 C：使用 CI 预构建镜像（免去服务器上编译）
@@ -151,7 +151,7 @@ docker run -d \
 把 `.github/workflows/docker.yml` 推上去之后，打标签即触发多架构构建：
 
 ```bash
-git tag v6.6.1 && git push origin v6.6.1
+git tag v6.6.2 && git push origin v6.6.2
 ```
 
 服务器上直接拉取（镜像默认是 private，需要先在 Packages 页面设为 Public，或先 `docker login ghcr.io`）：

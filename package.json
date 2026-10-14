@@ -1,0 +1,12 @@
+{
+  "name": "proxy-checker-frontend-tests",
+  "version": "6.6.2",
+  "private": true,
+  "scripts": {
+    "test": "node tools/test_workspace_frontend.js && node tools/test_result_performance.js && node tools/test_auto_loading.js && node tools/test_frontend_pipeline.js && node tools/test_cache_dom.js"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.0.0",
+    "jsdom": "26.1.0"
+  }
+}

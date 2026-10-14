@@ -32,6 +32,8 @@ var autoStatusTimer=null;
 var autoStatusCache=null;
 var autoResultsIndex=0;
 var autoSessionId='';
+var autoResultsTotal=0,autoResultsTimer=null,autoPageRequest=null,autoPageGeneration=0;
+var autoSummaryLoading=false;
 var autoRunResultKeys={};
 var autoStopRequestedSession='';
 var autoStopRepoPromptSession='';
@@ -40,6 +42,7 @@ var autoLastRunning=false;
 var RESULT_RENDER_BATCH=400;
 var resultRenderLimits={valid:RESULT_RENDER_BATCH,invalid:RESULT_RENDER_BATCH,repo:RESULT_RENDER_BATCH};
 var resultsSaveTimer=null;
+var resultsCacheRevision=0,resultsCacheDB=null,resultsCacheOpening=false,resultsCacheWaiters=[];
 var appSettings={
   check_rounds:2,
   max_check_rounds:3,
@@ -140,9 +143,10 @@ function dedup(){
   updateProxyCount();
   toast("去重: "+lines.length+" -> "+unique.length+" 个");
 }
-function post(url,data,cb){
+function post(url,data,cb,timeout){
   var fullUrl=API_BASE+url;
   var xhr=new XMLHttpRequest();xhr.open("POST",fullUrl,true);
+  xhr.timeout=timeout||0;
   xhr.setRequestHeader("Content-Type","application/json");
   var authToken=localStorage.getItem(AUTH_TOKEN_KEY);
   if(authToken)xhr.setRequestHeader("Authorization","Bearer "+authToken);
@@ -160,9 +164,11 @@ function post(url,data,cb){
       cb(res.error||"请先输入登录密码",res);
       return;
     }
+    if(xhr.status<200||xhr.status>=300){cb((res&&res.error)||('HTTP '+xhr.status),res);return}
     cb(null,res);
   };
   xhr.onerror=function(){cb("网络错误")};
+  xhr.ontimeout=function(){cb("请求超时")};
   xhr.send(JSON.stringify(data));
 }
 
@@ -269,6 +275,7 @@ function checkCapabilities(){
       updateTargetProfileUI();
     }
     autoModeAvailable=!!(res&&res.auto_mode);
+    checkedIncremental=!!res.checked_incremental;
     if(res&&res.settings)applyAppSettings(res.settings);
     updateAutoAvailability(res&&res.auto_mode_hint);
     if(authenticated&&!initializeWorkspace(res.workspace_token||''))return;
@@ -460,7 +467,7 @@ function startCheck(options){
   if(!requireAuthenticatedUI())return;
   if(busy) return;
   if(!options.skipAutoCheck&&autoModeAvailable){
-    post('/api/auto/status',{token:getUserToken()},function(err,res){
+    post('/api/auto/status',{token:getUserToken(),summary_only:true},function(err,res){
       if(!err&&res&&res.state&&res.state.running){
         renderAutoStatus(res);
         toast('自动任务正在执行，请先打开自动任务并停止');
@@ -560,9 +567,7 @@ function poll(){
       return;
     }
     if(res.new&&res.new.length>0){
-      res.new.forEach(function(r){
-        upsertResult(r);
-      });
+      upsertResults(res.new);
       resultsIndex+=res.new.length;
       var pct=Math.round(res.total_done/totalCount*100);
       progBar.style.width=pct+"%";
@@ -623,12 +628,6 @@ function resultKey(r){
   return proxyKeyValue((r&&r.original)||((r&&r.proxy)||''));
 }
 
-function removeResultByKey(key){
-  V=V.filter(function(r){return resultKey(r)!==key});
-  U=U.filter(function(r){return resultKey(r)!==key});
-  F=F.filter(function(r){return resultKey(r)!==key});
-}
-
 function activeFilter(selector){
   var active=document.querySelector(selector+' .fbtn.active');
   return active?active.dataset.f:'all';
@@ -670,15 +669,41 @@ function resultItemType(r){
   return 'invalid';
 }
 
-function renderLimitedList(items,listKey,emptyText){
-  if(!items.length)return '<div class="empty">'+emptyText+'</div>';
+function patchListRows(list,entries){
+  // 旧测试替身没有 DOM 插入 API；实际浏览器按键保留未变化节点。
+  if(!list.insertBefore){list.innerHTML=entries.map(function(e){return e.html}).join('');return}
+  var previous=list._proxyRows||new Map(),next=new Map(),cursor=list.firstChild;
+  var scroll=list.scrollTop;
+  entries.forEach(function(entry){
+    var cached=previous.get(entry.key),node;
+    if(cached&&cached.node.parentNode===list&&cached.html===entry.html)node=cached.node;
+    else{
+      var template=document.createElement('template');
+      template.innerHTML=entry.html;
+      node=template.content.firstElementChild;
+      if(cached&&cached.node.querySelector('.detail-panel.show')){
+        var detail=node.querySelector('.detail-panel');
+        if(detail)detail.classList.add('show');
+      }
+    }
+    if(node!==cursor)list.insertBefore(node,cursor);
+    cursor=node.nextSibling;
+    next.set(entry.key,{node:node,html:entry.html});
+  });
+  while(cursor){var after=cursor.nextSibling;list.removeChild(cursor);cursor=after}
+  list._proxyRows=next;
+  list.scrollTop=scroll;
+}
+
+function renderLimitedList(list,items,listKey,emptyText){
+  if(!items.length){patchListRows(list,[{key:'empty',html:'<div class="empty">'+emptyText+'</div>'}]);return}
   var limit=resultRenderLimits[listKey]||RESULT_RENDER_BATCH;
   var visible=items.slice(0,limit);
-  var html=visible.map(function(r){return itemHTML(r,resultItemType(r))}).join('');
+  var entries=visible.map(function(r){return {key:'result:'+resultKey(r),html:itemHTML(r,resultItemType(r))}});
   if(items.length>visible.length){
-    html+='<div class="list-more"><span>已渲染 '+visible.length+' / '+items.length+' 条，复制/入库仍会处理全部结果</span><button class="btn btn-ghost" onclick="showMoreResults(\''+listKey+'\')">➕ 显示更多</button></div>';
+    entries.push({key:'more',html:'<div class="list-more"><span>已渲染 '+visible.length+' / '+items.length+' 条，复制/入库仍会处理全部结果</span><button class="btn btn-ghost" onclick="showMoreResults(\''+listKey+'\')">➕ 显示更多</button></div>'});
   }
-  return html;
+  patchListRows(list,entries);
 }
 
 function renderResultLists(){
@@ -686,8 +711,8 @@ function renderResultLists(){
   var invalidFilter=activeFilter('#fFilters');
   var validItems=V.concat(U).filter(function(r){return resultPassesValidFilter(r,validFilter)});
   var invalidItems=F.filter(function(r){return resultPassesInvalidFilter(r,invalidFilter)});
-  validList.innerHTML=renderLimitedList(validItems,'valid','等待检测...');
-  failList.innerHTML=renderLimitedList(invalidItems,'invalid','等待检测...');
+  renderLimitedList(validList,validItems,'valid','等待检测...');
+  renderLimitedList(failList,invalidItems,'invalid','等待检测...');
 }
 
 function applyActiveResultFilters(){
@@ -718,14 +743,26 @@ function resetResultRenderLimits(scope){
   if(scope!=='results')resultRenderLimits.repo=RESULT_RENDER_BATCH;
 }
 
-function upsertResult(r){
-  if(!r)return false;
-  var key=resultKey(r);
-  if(!key)return false;
-  removeResultByKey(key);
-  if(r.valid)V.push(r);
-  else if(r.unstable)U.push(r);
-  else F.push(r);
+function upsertResults(rows){
+  // 批内按最后一次出现的顺序覆盖，旧列表只扫描一次，避免恢复大量结果时平方级增长。
+  // 索引仅属于当前批次，清空列表、恢复缓存或切换任务不需要维护额外的全局索引。
+  var updates=new Map();
+  rows.forEach(function(r){
+    var key=resultKey(r);
+    if(!key)return;
+    updates.delete(key);
+    updates.set(key,r);
+  });
+  if(!updates.size)return false;
+  var keep=function(r){return !updates.has(resultKey(r))};
+  V=V.filter(keep);
+  U=U.filter(keep);
+  F=F.filter(keep);
+  updates.forEach(function(r){
+    if(r.valid)V.push(r);
+    else if(r.unstable)U.push(r);
+    else F.push(r);
+  });
   return true;
 }
 
@@ -909,7 +946,7 @@ function itemHTML(r,type){
   var repoBtn=type==='invalid'?'':'<button class="copy-btn" onclick="event.stopPropagation();addSingleResultToRepo(this)" data-p="'+esc(r.proxy)+'">📦 添加到仓库</button>';
 
   // Detail panel (expandable)
-  var detailId='detail_'+Math.random().toString(36).substr(2,8);
+  var detailId='detail_'+type+'_'+encodeURIComponent(resultKey(r)).replace(/'/g,'%27');
   var detailHTML='';
   if(r.checks_detail && Object.keys(r.checks_detail).length>0){
     var d=r.checks_detail;
@@ -988,9 +1025,8 @@ function clearFailed(){
 function clearAll(){
   if(busy)stopCheck();
   proxyInput.value="";V=[];U=[];F=[];totalCount=0;sid=null;
-  clearTimeout(resultsSaveTimer);resultsSaveTimer=null;
+  clearResultsCache();
   resetResultRenderLimits();
-  try{localStorage.removeItem(RESULTS_KEY)}catch(e){}
   validList.innerHTML='<div class="empty">等待检测...</div>';
   failList.innerHTML='<div class="empty">等待检测...</div>';
   vCount.textContent="0";fCount.textContent="0";
@@ -1296,7 +1332,7 @@ function autoStatusText(data){
   return '等待下次 '+formatAutoTime(state.next_run_at,getAutoTimezone(data));
 }
 
-function renderAutoStatus(data){
+function renderAutoStatus(data,noPoll){
   if(!data)return;
   autoStatusCache=data;
   var badge=document.getElementById('autoStatusBadge');
@@ -1305,6 +1341,7 @@ function renderAutoStatus(data){
     var config=data.config||{};
     var progress=getAutoProgressPercent(data);
     badge.textContent=autoStatusText(data);
+    if(autoResultsTotal>autoResultsIndex)badge.textContent+=' · 恢复结果 '+autoResultsIndex+'/'+autoResultsTotal;
     badge.style.setProperty('--auto-progress',progress+'%');
     badge.className='auto-status-badge';
     if(state.running)badge.classList.add('running');
@@ -1315,8 +1352,10 @@ function renderAutoStatus(data){
   var stopBtn=document.getElementById('autoStopBtn');
   if(stopBtn)stopBtn.disabled=!(data.state&&data.state.running);
   renderAutoProgress(data);
-  if(data.state&&data.state.running)startAutoPolling(data.state.stage==='stopping'?1000:2500);
-  else startAutoPolling(10000);
+  if(!noPoll){
+    if(data.state&&data.state.running)startAutoPolling(data.state.stage==='stopping'?1000:2500);
+    else startAutoPolling(10000);
+  }
 }
 
 function refreshRepoAfterAuto(summary){
@@ -1346,11 +1385,11 @@ function processAutoRealtimeResults(data){
   var incoming=Array.isArray(data.new)?data.new:[];
   var changed=false;
   if(incoming.length){
+    changed=upsertResults(incoming);
     incoming.forEach(function(result){
       var key=resultKey(result);
       if(!key)return;
       autoRunResultKeys[key]=true;
-      changed=upsertResult(result)||changed;
     });
     markCheckedBatch(incoming.map(function(r){return r.original||r.proxy}).filter(Boolean));
     saveCheckedLocal();
@@ -1368,7 +1407,7 @@ function processAutoRealtimeResults(data){
     refreshRepoAfterAuto(state.last_summary);
   }
   autoLastRunning=!!state.running;
-  if(!state.running&&state.status==='stopped'){
+  if(!state.running&&state.status==='stopped'&&autoResultsIndex>=autoResultsTotal){
     maybePromptAutoStoppedRepo(sessionId||autoStopRequestedSession);
   }
 }
@@ -1401,18 +1440,81 @@ function startAutoPolling(delay){
   autoStatusTimer=setTimeout(loadAutoStatus,delay||5000);
 }
 
+function acceptAutoStatus(data){
+  if(Object.prototype.hasOwnProperty.call(data,'results_session_id')){
+    var session=data.results_session_id||'';
+    if(session!==autoSessionId){
+      autoSessionId=session;
+      autoResultsIndex=0;
+      autoRunResultKeys={};
+      autoPageGeneration++;
+      autoPageRequest=null;
+      clearTimeout(autoResultsTimer);
+    }
+    autoResultsTotal=data.results_total||0;
+    renderAutoStatus(data);
+    // 摘要的 results_index 是服务器总数，不是已经收到的结果游标。
+    processAutoRealtimeResults(Object.assign({},data,{new:[],results_index:autoResultsIndex}));
+    loadAutoResultPage();
+  }else{
+    // 兼容尚未升级的服务端。
+    renderAutoStatus(data);
+    processAutoRealtimeResults(data);
+  }
+}
+
+function loadAutoResultPage(){
+  if(!authenticated||autoPageRequest||!autoSessionId||autoResultsIndex>=autoResultsTotal)return;
+  var request={generation:autoPageGeneration,session:autoSessionId};
+  autoPageRequest=request;
+  post('/api/auto/results',{token:getUserToken(),session_id:request.session,since:autoResultsIndex,limit:1000},function(err,res){
+    if(request.generation!==autoPageGeneration||request.session!==autoSessionId)return;
+    autoPageRequest=null;
+    if(err||!res||res.error){
+      if(res&&(res.reset||res.expired)){
+        autoResultsTotal=autoResultsIndex;
+        loadAutoStatus();
+      }else{
+        clearTimeout(autoResultsTimer);
+        autoResultsTimer=setTimeout(loadAutoResultPage,3000);
+      }
+      return;
+    }
+    if(res.session_id!==autoSessionId)return;
+    autoResultsTotal=res.results_total;
+    processAutoRealtimeResults(Object.assign({},autoStatusCache,{new:res.new,results_index:res.results_index}));
+    renderAutoStatus(autoStatusCache,true);
+    if(res.has_more){
+      clearTimeout(autoResultsTimer);
+      autoResultsTimer=setTimeout(loadAutoResultPage,50);
+    }
+  },30000);
+}
+
 function loadAutoStatus(callback){
   if(!autoModeAvailable||!authenticated){
     if(callback)callback(null);
     return;
   }
-  post('/api/auto/status',{token:getUserToken(),since:autoResultsIndex,session_id:autoSessionId},function(err,res){
-    if(!err&&res){
-      processAutoRealtimeResults(res);
-      renderAutoStatus(res);
+  if(autoSummaryLoading)return;
+  autoSummaryLoading=true;
+  post('/api/auto/status',{token:getUserToken(),since:autoResultsIndex,session_id:autoSessionId,summary_only:true},function(err,res){
+    autoSummaryLoading=false;
+    if(!err&&res&&!res.error){
+      acceptAutoStatus(res);
       if(callback)callback(res);
-    }else if(callback)callback(null);
-  });
+    }else{
+      var badge=document.getElementById('autoStatusBadge');
+      if(badge){
+        badge.textContent='状态加载失败，正在重试';
+        badge.className='auto-status-badge error';
+        badge.title=err||(res&&res.error)||'无法读取自动任务状态';
+      }
+      // 暂时断网或网关错误不代表任务关闭；保留结果和续传游标，稍后重新获取。
+      startAutoPolling(5000);
+      if(callback)callback(null);
+    }
+  },60000); // 首次响应可能包含数万条结果，为低速网络留出传输时间。
 }
 
 function autoProfileOptions(selected){
@@ -1482,14 +1584,13 @@ function openAutoSettings(){
     return;
   }
   showAutoModal(autoStatusCache||{config:{enabled:false,target_profile:currentTargetProfile,detect_mode:'skip',repo_update_policy:'stable_only'},state:{status:'idle',running:false}});
-  post('/api/auto/get',{token:getUserToken(),since:autoResultsIndex,session_id:autoSessionId},function(err,res){
+  post('/api/auto/get',{token:getUserToken(),since:autoResultsIndex,session_id:autoSessionId,summary_only:true},function(err,res){
     if(!document.querySelector('.modal-overlay[data-modal=\"auto\"]'))return;
     if(err||res.error){
       toast(err||res.error||'读取自动任务失败');
       return;
     }
-    processAutoRealtimeResults(res);
-    renderAutoStatus(res);
+    acceptAutoStatus(res);
     showAutoModal(res);
   });
 }
@@ -1559,25 +1660,27 @@ function readAutoConfigFromModal(){
 
 function saveAutoSettings(){
   var config=readAutoConfigFromModal();
-  post('/api/auto/save',{token:getUserToken(),config:config},function(err,res){
+  post('/api/auto/save',{token:getUserToken(),config:config,summary_only:true},function(err,res){
     if(err||res.error){toast('保存失败: '+(err||res.error));return}
-    renderAutoStatus(res);
+    acceptAutoStatus(res);
     toast('自动任务设置已保存');
   });
 }
 
 function runAutoNow(){
   var config=readAutoConfigFromModal();
-  post('/api/auto/save',{token:getUserToken(),config:config},function(saveErr,saveRes){
+  post('/api/auto/save',{token:getUserToken(),config:config,summary_only:true},function(saveErr,saveRes){
     if(saveErr||saveRes.error){toast('保存失败: '+(saveErr||saveRes.error));return}
-    post('/api/auto/run-now',{token:getUserToken()},function(err,res){
+    post('/api/auto/run-now',{token:getUserToken(),summary_only:true},function(err,res){
       if(err||res.error){toast(err||res.error||'启动失败');if(res)renderAutoStatus(res);return}
-      autoResultsIndex=0;
-      autoSessionId=(res.state&&res.state.session_id)||'';
-      autoRunResultKeys={};
+      if(!Object.prototype.hasOwnProperty.call(res,'results_session_id')){
+        autoResultsIndex=0;
+        autoSessionId=(res.state&&res.state.session_id)||'';
+        autoRunResultKeys={};
+      }
       autoStopRequestedSession='';
       autoStopRepoPromptSession='';
-      renderAutoStatus(res);
+      acceptAutoStatus(res);
       toast(res.started?'自动任务已启动':'自动任务已在运行');
     });
   });
@@ -1586,10 +1689,9 @@ function runAutoNow(){
 function stopAutoNow(){
   var state=(autoStatusCache&&autoStatusCache.state)||{};
   autoStopRequestedSession=state.session_id||autoSessionId||('auto_stop_'+Date.now());
-  post('/api/auto/stop',{token:getUserToken(),since:autoResultsIndex,session_id:autoSessionId},function(err,res){
+  post('/api/auto/stop',{token:getUserToken(),since:autoResultsIndex,session_id:autoSessionId,summary_only:true},function(err,res){
     if(err){toast(err);return}
-    processAutoRealtimeResults(res);
-    renderAutoStatus(res);
+    acceptAutoStatus(res);
     toast(res.stopped?'已请求停止自动任务':'当前没有自动任务');
   });
 }
@@ -1902,6 +2004,8 @@ var CHECKED_KEY='proxy_checker_checked';
 var detectMode=localStorage.getItem('proxy_checker_detect_mode')||'skip'; // 'skip' or 'force'
 var checkedProxies=new Set();
 var checkedSyncTimer=null;
+var checkedIncremental=false,checkedPending=new Set(),checkedSyncBusy=false;
+var checkedClearPending=false,checkedClearVersion=0,checkedLocalTimer=null;
 
 function loadCheckedLocal(){
   try{
@@ -1910,23 +2014,37 @@ function loadCheckedLocal(){
   }catch(e){checkedProxies=new Set()}
 }
 function saveCheckedLocal(){
-  try{localStorage.setItem(CHECKED_KEY,JSON.stringify([...checkedProxies]))}catch(e){}
+  if(checkedLocalTimer)return;
+  checkedLocalTimer=setTimeout(function(){
+    checkedLocalTimer=null;
+    try{localStorage.setItem(CHECKED_KEY,JSON.stringify([...checkedProxies]))}catch(e){}
+  },3000);
 }
-function syncCheckedToServer(){
-  clearTimeout(checkedSyncTimer);
+function syncCheckedToServer(delay){
+  if(checkedSyncBusy||checkedSyncTimer)return;
+  if(checkedIncremental&&!checkedClearPending&&!checkedPending.size)return;
   checkedSyncTimer=setTimeout(function(){
-    var token=getUserToken();
-    var arr=[...checkedProxies];
-    // Limit to 50000 to avoid huge payloads
-    if(arr.length>50000) arr=arr.slice(-50000);
-    post('/api/checked/save',{proxies:arr,token:token},function(){});
-  },1500);
+    checkedSyncTimer=null;
+    var clearing=checkedClearPending,version=checkedClearVersion;
+    var arr=clearing?[]:checkedIncremental?Array.from(checkedPending).slice(0,1000):Array.from(checkedProxies).slice(-50000);
+    checkedSyncBusy=true;
+    post(checkedIncremental&&!clearing?'/api/checked/append':'/api/checked/save',{proxies:arr,token:getUserToken()},function(err,res){
+      checkedSyncBusy=false;
+      if(!err&&res&&res.ok&&version===checkedClearVersion){
+        if(clearing)checkedClearPending=false;
+        else arr.forEach(function(p){checkedPending.delete(p)});
+      }
+      if(checkedClearPending||checkedPending.size)syncCheckedToServer(err||!res||!res.ok?5000:100);
+    },30000);
+  },delay||5000);
 }
 function loadCheckedFromServer(callback){
   var token=getUserToken();
+  var version=checkedClearVersion;
   var xhr=new XMLHttpRequest();
   xhr.open('GET',API_BASE+'/api/checked/'+token+'.txt',true);
   xhr.onload=function(){
+    if(version!==checkedClearVersion){if(callback)callback(0);return}
     if(xhr.status===200){
       var lines=xhr.responseText.split('\n').filter(function(l){return l.trim()});
       lines.forEach(function(l){checkedProxies.add(l.trim())});
@@ -1937,8 +2055,17 @@ function loadCheckedFromServer(callback){
   xhr.onerror=function(){if(callback)callback(0)};
   xhr.send();
 }
-function markChecked(proxy){checkedProxies.add(proxy)}
-function markCheckedBatch(proxies){proxies.forEach(function(p){checkedProxies.add(p)})}
+function markChecked(proxy){
+  if(checkedProxies.has(proxy))return false;
+  checkedProxies.add(proxy);
+  checkedPending.add(proxy);
+  return true;
+}
+function markCheckedBatch(proxies){
+  var changed=false;
+  proxies.forEach(function(p){changed=markChecked(p)||changed});
+  return changed;
+}
 function isChecked(proxy){return checkedProxies.has(proxy)}
 function getCheckedCount(){return checkedProxies.size}
 
@@ -1971,6 +2098,9 @@ function clearCheckedHistory(){
   if(!getCheckedCount()){toast('检测记录为空');return}
   if(!confirm('确定清空检测记录？清空后所有代理将被重新检测。'))return;
   checkedProxies.clear();
+  checkedPending.clear();
+  checkedClearVersion++;
+  checkedClearPending=true;
   saveCheckedLocal();
   syncCheckedToServer();
   updateSkipBadge();
@@ -1984,18 +2114,97 @@ function clearCheckedHistory(){
   else{label.textContent='跳过已检测'}
 })();
 
+function withResultsDB(callback){
+  if(!window.indexedDB){callback(null);return}
+  if(resultsCacheDB){callback(resultsCacheDB);return}
+  resultsCacheWaiters.push(callback);
+  if(resultsCacheOpening)return;
+  resultsCacheOpening=true;
+  var answered=false;
+  function finish(db){
+    if(answered){if(db)db.close();return}
+    answered=true;resultsCacheOpening=false;resultsCacheDB=db;
+    var waiting=resultsCacheWaiters;resultsCacheWaiters=[];
+    waiting.forEach(function(cb){cb(db)});
+  }
+  try{
+    var request=window.indexedDB.open('proxy-checker-cache-v1',1);
+    request.onupgradeneeded=function(){request.result.createObjectStore('results')};
+    request.onsuccess=function(){
+      request.result.onversionchange=function(){request.result.close();resultsCacheDB=null};
+      finish(request.result);
+    };
+    request.onerror=request.onblocked=function(){finish(null)};
+  }catch(e){finish(null)}
+}
+
+function fallbackResultsCache(key,value){
+  // 降级时只缓存完整的小任务；大任务刷新后从服务器重新恢复，不能截断后误用游标。
+  try{
+    if(value.valid.length+value.unstable.length+value.invalid.length<=2000)localStorage.setItem(key,JSON.stringify(value));
+    else localStorage.setItem(key,'{"valid":[],"unstable":[],"invalid":[]}');
+  }catch(e){}
+}
+
 function saveResultsNow(){
-  clearTimeout(resultsSaveTimer);
-  resultsSaveTimer=null;
-  try{localStorage.setItem(RESULTS_KEY,JSON.stringify({valid:V,unstable:U,invalid:F}))}catch(e){}
+  clearTimeout(resultsSaveTimer);resultsSaveTimer=null;
+  var key=RESULTS_KEY,revision=resultsCacheRevision;
+  var value={valid:V.slice(),unstable:U.slice(),invalid:F.slice()};
+  withResultsDB(function(db){
+    if(key!==RESULTS_KEY||revision!==resultsCacheRevision)return;
+    if(!db){fallbackResultsCache(key,value);return}
+    try{
+      var tx=db.transaction('results','readwrite');
+      tx.objectStore('results').put(value,API_BASE+'|'+key);
+      tx.oncomplete=function(){try{localStorage.removeItem(key)}catch(e){}};
+      tx.onabort=tx.onerror=function(){
+        if(key===RESULTS_KEY&&revision===resultsCacheRevision)fallbackResultsCache(key,value);
+      };
+    }catch(e){fallbackResultsCache(key,value)}
+  });
 }
 function saveResults(){
-  clearTimeout(resultsSaveTimer);
-  resultsSaveTimer=setTimeout(saveResultsNow,500);
+  resultsCacheRevision++;
+  if(!resultsSaveTimer)resultsSaveTimer=setTimeout(saveResultsNow,5000);
 }
-function loadSavedResults(){
-  try{var d=JSON.parse(localStorage.getItem(RESULTS_KEY));if(d){V=d.valid||[];U=d.unstable||[];F=d.invalid||[];return true}}catch(e){}
-  return false;
+function clearResultsCache(){
+  resultsCacheRevision++;
+  clearTimeout(resultsSaveTimer);resultsSaveTimer=null;
+  var key=RESULTS_KEY;
+  // 小型空快照也是持久化清空标记：即使 IndexedDB 删除失败，刷新也不能恢复旧结果。
+  try{localStorage.setItem(key,'{"valid":[],"unstable":[],"invalid":[]}')}catch(e){}
+  withResultsDB(function(db){
+    if(db){try{db.transaction('results','readwrite').objectStore('results').delete(API_BASE+'|'+key)}catch(e){}}
+  });
+}
+function loadSavedResults(callback){
+  var key=RESULTS_KEY,revision=resultsCacheRevision,finished=false;
+  function finish(value,legacy){
+    if(finished)return;finished=true;
+    if(key!==RESULTS_KEY||revision!==resultsCacheRevision){if(callback)callback(false);return}
+    if(value){
+      V=Array.isArray(value.valid)?value.valid:[];
+      U=Array.isArray(value.unstable)?value.unstable:[];
+      F=Array.isArray(value.invalid)?value.invalid:[];
+      if(legacy)saveResultsNow();
+    }
+    if(callback)callback(!!value);
+  }
+  function legacy(){
+    var value=null;
+    try{value=JSON.parse(localStorage.getItem(key))}catch(e){}
+    finish(value,true);
+  }
+  // 正常的 IDB 写入会删除旧快照；仍存在的本地快照表示待迁移、降级或清空，优先采用。
+  try{if(localStorage.getItem(key)!==null){legacy();return}}catch(e){}
+  withResultsDB(function(db){
+    if(!db){legacy();return}
+    try{
+      var request=db.transaction('results','readonly').objectStore('results').get(API_BASE+'|'+key);
+      request.onsuccess=function(){if(request.result)finish(request.result,false);else legacy()};
+      request.onerror=legacy;
+    }catch(e){legacy()}
+  });
 }
 
 function restoreActiveSession(){
@@ -2151,20 +2360,21 @@ function renderRepo(){
   var cnt=document.getElementById('repoCount');
   cnt.textContent=repo.length;
   if(!repo.length){
-    list.innerHTML='<div class="empty">仓库为空，检测完成后可将代理添加到仓库</div>';
+    patchListRows(list,[{key:'empty',html:'<div class="empty">仓库为空，检测完成后可将代理添加到仓库</div>'}]);
     return;
   }
-  var html='';
+  var entries=[];
   var displayRepo=repo.map(function(p,i){return {item:p,index:i}}).sort(function(a,b){
     return (b.item.updated||b.item.added||0)-(a.item.updated||a.item.added||0);
   }).filter(function(entry){return repoPassesFilter(entry.item,activeFilter('#repoFilters'))});
   if(!displayRepo.length){
-    list.innerHTML='<div class="empty">当前筛选没有匹配的仓库代理</div>';
+    patchListRows(list,[{key:'empty',html:'<div class="empty">当前筛选没有匹配的仓库代理</div>'}]);
     return;
   }
   var limit=resultRenderLimits.repo||RESULT_RENDER_BATCH;
   var visibleRepo=displayRepo.slice(0,limit);
   visibleRepo.forEach(function(entry){
+    var html='';
     var p=entry.item;
     var i=entry.index;
     var gradeColors={'A':'#22c55e','B':'#10b981','C':'#eab308','D':'#f97316','F':'#ef4444'};
@@ -2197,11 +2407,12 @@ function renderRepo(){
       '<button class="copy-btn" style="opacity:0.6" onclick="event.stopPropagation();clip(this)" data-p="'+esc(p.proxy)+'">📋 复制</button>'+
       '<button class="copy-btn" style="opacity:0.6;color:#ef4444" onclick="event.stopPropagation();removeFromRepo('+i+')">🗑 删除</button>'+
       '</div></div>';
+    entries.push({key:'repo:'+proxyKeyValue(p.proxy),html:html});
   });
   if(displayRepo.length>visibleRepo.length){
-    html+='<div class="list-more"><span>已渲染 '+visibleRepo.length+' / '+displayRepo.length+' 条，复制/导出仍会处理全部仓库</span><button class="btn btn-ghost" onclick="showMoreResults(\'repo\')">➕ 显示更多</button></div>';
+    entries.push({key:'more',html:'<div class="list-more"><span>已渲染 '+visibleRepo.length+' / '+displayRepo.length+' 条，复制/导出仍会处理全部仓库</span><button class="btn btn-ghost" onclick="showMoreResults(\'repo\')">➕ 显示更多</button></div>'});
   }
-  list.innerHTML=html;
+  patchListRows(list,entries);
   list.style.maxHeight='420px';
   list.style.overflowY='auto';
 }
@@ -2468,7 +2679,8 @@ function restoreWorkspaceData(){
       if(count>0){toast('从服务器恢复 '+count+' 个仓库代理')}
     },{replaceEmpty:!!serverWorkspaceToken});
   }
-  if(loadSavedResults()){
+  loadSavedResults(function(restored){
+  if(restored){
     var all=V.concat(U).concat(F);
     if(all.length>0){
       resetResultRenderLimits('results');
@@ -2477,7 +2689,8 @@ function restoreWorkspaceData(){
       statusText.textContent="已恢复 "+all.length+" 条历史结果";
     }
   }
-  restoreActiveSession();
+  if(!busy)restoreActiveSession();
+  });
 }
 
 // Get repo link — sync to server and show URL
