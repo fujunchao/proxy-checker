@@ -1402,6 +1402,7 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
     state.pop("inflight_inputs", None)
     state.pop("inflight_queue", None)
     selection_snapshot = store.snapshot()
+    selection_epoch = selection_snapshot["epoch"]
     work_type, proxies, info = choose_batch(selection_snapshot, state, config, clock())
     update_auto_runtime(token, work_type=work_type, **info, **store.summary())
     log.info("maintenance batch workspace=%s run=%s type=%s due=%s pending=%s",
@@ -1445,6 +1446,8 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
             else:
                 state["cursor"] = end
             selection_snapshot = await asyncio.to_thread(store.snapshot)
+            # 抓取期间的人工修改同样使本批失效，不能在抓取结束后领取新代次。
+            selection_snapshot["epoch"] = selection_epoch
             # 存量只由 refresh 管理；缺档位和其他档位不因发现同址而被迁移。
             existing_keys = {proxy_key(i["proxy"]) for i in selection_snapshot["items"]}
             checked = set(map(proxy_key, read_checked_list(token))) if config["detect_mode"] == "skip" else set()
@@ -1520,6 +1523,7 @@ def execute_auto_run(token, config, run_id, reason):
             summary = execute_maintenance_run(token, config, runtime)
             finalize_auto_run(token, runtime, "stopped" if runtime["stop"].is_set() else "completed", repo_summary=summary)
             return
+        repo_snapshot = repo_store(token).snapshot()
         update_auto_runtime(token, stage="fetching", status="running")
         if not FETCH_PROXIES_AVAILABLE:
             raise RuntimeError("fetch_proxies 模块不可用")
@@ -1534,7 +1538,6 @@ def execute_auto_run(token, config, run_id, reason):
         source_proxies = normalize_proxy_list(fetched)
 
         update_auto_runtime(token, stage="loading_repo", source_count=len(source_proxies))
-        repo_snapshot = repo_store(token).snapshot()
         repo = RepoView(repo_snapshot)
         repo_proxies = normalize_proxy_list(item.get("proxy") for item in repo)
         combined = normalize_proxy_list(source_proxies + repo_proxies)

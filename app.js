@@ -2767,6 +2767,7 @@ function importRepoJson(input){
 function restoreWorkspaceData(){
   renderRepo();
   loadCheckedLocal();
+  if(checkedClearPending||checkedPending.size)syncCheckedToServer();
   updateSkipBadge();
   loadCheckedFromServer(function(count){
     if(count>0){updateSkipBadge();toast('从服务器恢复 '+count+' 条检测记录')}

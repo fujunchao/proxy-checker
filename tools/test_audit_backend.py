@@ -161,6 +161,7 @@ class AuditBackend(workspace.WorkspaceTest):
                     await asyncio.Event().wait()
                 for proxy in proxies:
                     await on_result({**item(2), "proxy": proxy, "original": proxy, "terminal_complete": True,
+                                     "started_at": int(now[0] * 1000),
                                      "completed_at": int(now[0] * 1000)})
         for i in range(5):
             s.execute_maintenance_run(token, self.config(batch_seconds=1, discover_batch=1),
