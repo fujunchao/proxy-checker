@@ -10,6 +10,11 @@ import urllib.request
 from curl_cffi import requests as cffi_requests
 
 
+def maintenance_source_ids():
+    """稳定来源标识；维护队列按标识保存，不依赖列表位置持久化。"""
+    return [s["id"] for s in PROXY_SOURCES if s.get("parser") == "plain"]
+
+
 def fetch_maintenance_source(source_index, stop_event):
     """持续维护首版轮转纯文本源；字节、耗时和候选数都有上限。
 

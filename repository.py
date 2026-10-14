@@ -106,7 +106,13 @@ class Repository:
         with self.lock:
             data = self._load()
             return {"repo_revision": data["revision"], "repo_count": len(data["items"]),
-                    "last_published_at": data["last_published_at"]}
+                    "last_published_at": data["last_published_at"],
+                    "maintenance_totals": copy.deepcopy(data.get("maintenance_totals", {}))}
+
+    def _add_maintenance_totals(self, data, **deltas):
+        totals = data.setdefault("maintenance_totals", {"since": int(self.clock() * 1000)})
+        for key, count in deltas.items():
+            totals[key] = totals.get(key, 0) + count
 
     def _commit(self, data, items=None, published=False):
         data["revision"] += int(items is not None)
@@ -180,7 +186,7 @@ class Repository:
                                    "current_count": len(current), "submitted_count": len(incoming),
                                    "repo_revision": data["revision"]}
 
-    def begin(self, run_id, profile, config_generation, inputs, snapshot=None):
+    def begin(self, run_id, profile, config_generation, inputs, snapshot=None, work_type=None):
         with self.lock:
             data = self.snapshot()
             # 选批和登记必须来自同一读取代次，不能给旧候选补发人工修改后的新 epoch。
@@ -193,7 +199,7 @@ class Repository:
                 raise RepositoryError("在途批次数或候选数超过上限")
             run = {"boot": BOOT_ID, "epoch": data["epoch"], "profile": profile,
                    "config_generation": config_generation, "seen": [],
-                   "started_at": int(self.clock() * 1000)}
+                   "started_at": int(self.clock() * 1000), "work_type": work_type}
             data["runs"][run_id] = run
             self._commit(data)
             return {"run_id": run_id, "boot": BOOT_ID, "epoch": run["epoch"],
@@ -253,6 +259,11 @@ class Repository:
                     out["repo_removed"] += 1
             if dirty:
                 run["seen"] = list(seen)
+                if run.get("work_type") in ("refresh", "discover"):
+                    # 与数据和去重收据同一次提交：重启、重试均不能重复累计入库。
+                    self._add_maintenance_totals(data, **{
+                        run["work_type"] + "_checked": out["accepted"],
+                        **{k: out[k] for k in ("repo_added", "repo_updated", "repo_removed")}})
                 self._commit(data, list(rows.values()), published=True)
             return {**out, **self.summary()}
 
@@ -270,10 +281,15 @@ class Repository:
             if data["runs"].pop(run_id, None) is not None:
                 self._commit(data)
 
-    def maintenance(self, update=None):
+    def maintenance(self, update=None, *, source_event=None):
         with self.lock:
             data = self.snapshot()
             if update is not None:
                 data["maintenance"] = copy.deepcopy(update)
+                if source_event and data.get("last_source_event") != source_event["id"]:
+                    data["last_source_event"] = source_event["id"]
+                    self._add_maintenance_totals(data, source_fetches=int(source_event["ok"]),
+                        source_errors=int(not source_event["ok"]),
+                        source_candidates=source_event.get("count", 0))
                 self._commit(data)
             return copy.deepcopy(data["maintenance"])

@@ -1374,7 +1374,7 @@ function renderAutoStatus(data,noPoll){
     if(state.running)badge.classList.add('running');
     else if(config.enabled&&state.status!=='failed'&&state.status!=='interrupted')badge.classList.add('waiting');
     else if(state.status==='failed'||state.status==='interrupted')badge.classList.add('error');
-    badge.title='进度: '+progress+'%，已拉取 '+(state.source_count||0)+'，仓库 '+(state.repo_count||0)+'，跳过 '+(state.skipped||0)+'，计划时区: '+getAutoTimezone(data);
+    badge.title='进度: '+progress+'%，本批新拉取 '+(state.source_count||0)+'，仓库 '+(state.repo_count||0)+'，跳过 '+(state.skipped||0)+'，计划时区: '+getAutoTimezone(data);
   }
   var stopBtn=document.getElementById('autoStopBtn');
   if(stopBtn)stopBtn.disabled=!(data.state&&data.state.running);
@@ -1601,6 +1601,16 @@ function renderAutoProgress(data){
     html+='<div>发现队列 '+value(state.discovery_pending)+' · 待发布 '+value(state.pending_count)+' · 任务级未完成 '+value(state.incomplete_count)+'</div>';
     html+='<div>已发布仓库 '+value(state.repo_count)+' · 版本 '+value(state.repo_revision)+' · 最近发布 '+(state.last_published_at?esc(formatAutoTime(state.last_published_at/1000,tz)):'尚无发布')+'</div>';
     html+='<div>本批提交: 新增 '+value(state.repo_added)+' / 更新 '+value(state.repo_updated)+' / 移除 '+value(state.repo_removed)+' / 冲突跳过 '+value(state.conflict_skipped)+'</div>';
+    html+='<div>来源覆盖 '+value(state.source_supported_count)+'/'+value(state.source_total_count)+'（持续维护仅纯文本源） · 本批来源 '+esc(state.source_current_id||'存量／等待中')+'</div>';
+    html+='<div>最近抓取: '+(state.source_last_fetched_at?esc(formatAutoTime(state.source_last_fetched_at/1000,tz))+' · '+esc(state.source_last_id||'-'):'尚无升级后记录')+'</div>';
+    var totals=state.maintenance_totals||{};
+    if(totals.since){
+      html+='<div>本工作区升级后累计（自 '+esc(formatAutoTime(totals.since/1000,tz))+'，跨档位，重入库重复计次）</div>';
+      html+='<div>成功抓取 '+value(totals.source_fetches||0)+' 次 · 读取候选 '+value(totals.source_candidates||0)+' 条次 · 来源错误 '+value(totals.source_errors||0)+' 次</div>';
+      html+='<div>已提交检测: 发现 '+value(totals.discover_checked||0)+' / 复测 '+value(totals.refresh_checked||0)+' · 累计新增 '+value(totals.repo_added||0)+' / 累计更新 '+value(totals.repo_updated||0)+' / 累计移除 '+value(totals.repo_removed||0)+'</div>';
+    }else{
+      html+='<div>升级后累计: 尚无记录，不从当前批次推算历史总量。</div>';
+    }
     html+='<div>缺少档位待人工确认 '+value(state.migration_required)+' · 其他档位保留 '+value(state.other_profile_count)+'</div>';
     html+='<div>目标间隔不是时限保证；页面仅保留各分类最近 1000 条诊断，检测通过不等于已提交。</div>';
     if(state.source_error)html+='<div>'+esc(state.source_error)+'；下批仍优先检查存量。</div>';
@@ -1611,7 +1621,7 @@ function renderAutoProgress(data){
   if(config.enabled)html+='<div>下次执行: '+esc(state.next_run_text||formatAutoTime(state.next_run_at,tz))+'</div>';
   if(state.running){
     html+='<div>进度: '+(state.done||0)+'/'+(state.total||0)+'，有效 '+(state.valid_count||0)+'，不稳定 '+(state.unstable_count||0)+'，失效 '+(state.invalid_count||0)+'</div>';
-    html+='<div>已拉取 '+(state.source_count||0)+'，仓库 '+(state.repo_count||0)+'，去重后 '+(state.input_count||0)+'，跳过已检测 '+(state.skipped||0)+'</div>';
+    html+='<div>本批新拉取 '+(state.source_count||0)+'，仓库 '+(state.repo_count||0)+'，本批待检测 '+(state.input_count||0)+'，过滤跳过 '+(state.skipped||0)+'</div>';
   }
   if(state.last_summary){
     var s=state.last_summary;
@@ -1621,7 +1631,7 @@ function renderAutoProgress(data){
   if(Array.isArray(state.history)&&state.history.length){
     html+='<div class="auto-history">';
     state.history.slice(-5).reverse().forEach(function(item){
-      html+='<div>'+esc(formatAutoTime(item.finished_at,item.timezone||tz))+' · '+esc(item.status||'-')+' · '+(item.done||0)+'/'+(item.total||0)+' · 有效 '+(item.valid_count||0)+'</div>';
+      html+='<div>'+esc(formatAutoTime(item.finished_at,item.timezone||tz))+' · '+esc(item.work_type==='refresh'?'存量复测':item.work_type==='discover'?'新代理发现':item.status||'-')+' · '+(item.done||0)+'/'+(item.total||0)+' · 有效 '+(item.valid_count||0)+'</div>';
     });
     html+='</div>';
   }
@@ -1663,7 +1673,7 @@ function showAutoModal(data){
   html+='<div class="auto-form">';
   html+='<div class="auto-field full"><label><input id="autoEnabled" type="checkbox" '+(config.enabled?'checked':'')+' style="width:auto;height:auto;margin-right:8px">启用后台自动检测</label></div>';
   html+='<div class="auto-field full"><label>运行方式</label><select id="autoMaintenanceMode"><option value="legacy">旧模式：按计划完成整轮后发布</option><option value="continuous">持续维护（推荐）：存量优先、发现分批、中途发布</option></select></div>';
-  html+='<div class="auto-field full"><div class="settings-note">持续维护：存量目标 15 分钟复测一次，不受已检测历史跳过；每批存量最多 100 / 发现最多 200，预算 120 秒，每 20 条或 10 秒发布。旧时间规则仅旧模式生效；停止后等待再次保存或立即运行。</div></div>';
+  html+='<div class="auto-field full"><div class="settings-note">持续维护：存量目标 15 分钟复测一次，不受已检测历史跳过；默认连续复测耗时达到 120 秒即让出发现机会，零散到期项不连续占批。来源每个小批次轮转；每批存量最多 100 / 发现最多 200，预算 120 秒，每 20 条或 10 秒发布。旧时间规则仅旧模式生效；停止后等待再次保存或立即运行。</div></div>';
   html+='<div class="auto-field"><label>时间规则</label><select id="autoScheduleType" onchange="updateAutoScheduleFields()"><option value="interval" '+(config.schedule_type==='interval'?'selected':'')+'>每隔 N 小时</option><option value="daily" '+(config.schedule_type==='daily'?'selected':'')+'>每天固定时间</option></select></div>';
   html+='<div class="auto-field" id="autoIntervalField"><label>间隔小时</label><input id="autoIntervalHours" type="number" min="0.01" max="720" step="0.25" value="'+esc(config.interval_hours||6)+'"></div>';
   html+='<div class="auto-field" id="autoDailyField"><label>固定时间（计划时区）</label><input id="autoDailyTime" type="time" value="'+esc(config.daily_time||'03:00')+'"></div>';

@@ -11,8 +11,8 @@ import functools
 import uuid
 from contextlib import contextmanager
 from repository import Repository, RepositoryError, endpoint
-from maintenance import FairBudget, IncrementalBatch, check_batches, choose_batch
-from fetch_proxies import fetch_maintenance_source
+from maintenance import FairBudget, IncrementalBatch, check_batches, choose_batch, DiscoveryQueues, discovery_pending
+from fetch_proxies import fetch_maintenance_source, maintenance_source_ids, PROXY_SOURCES
 from datetime import datetime, timedelta, timezone
 from http import cookies
 from http.server import HTTPServer
@@ -700,6 +700,7 @@ def default_auto_config():
         "publish_count": 20,
         "publish_seconds": 10,
         "refresh_share": 4,
+        "refresh_budget_seconds": 120,
         "schedule_type": "interval",
         "interval_hours": 6,
         "daily_time": "03:00",
@@ -761,7 +762,7 @@ def normalize_auto_config(config):
         **{k: max(lo, min(hi, get_int_from(merged, k, defaults[k]))) for k, lo, hi in (
             ("refresh_seconds", 30, 86400), ("refresh_batch", 1, 100), ("discover_batch", 1, 200),
             ("batch_seconds", 1, 120), ("publish_count", 1, 200), ("publish_seconds", 1, 60),
-            ("refresh_share", 1, 20))},
+            ("refresh_share", 1, 20), ("refresh_budget_seconds", 1, 600))},
         "schedule_type": schedule_type,
         "interval_hours": interval_hours,
         "daily_time": normalize_daily_time(merged.get("daily_time")),
@@ -1152,7 +1153,8 @@ def is_auto_running(token):
 MAINTENANCE_STATUS_FIELDS = ("work_type", "due_count", "unknown_age_count", "oldest_checked_at",
     "migration_required", "other_profile_count", "discovery_pending", "pending_count", "incomplete_count",
     "last_published_at", "repo_revision", "repo_added", "repo_updated", "repo_removed", "conflict_skipped",
-    "last_progress_at", "source_error")
+    "last_progress_at", "source_error", "source_current_id", "source_last_id", "source_last_fetched_at",
+    "source_supported_count", "source_total_count", "maintenance_totals")
 
 
 def update_auto_runtime(token, **fields):
@@ -1374,7 +1376,7 @@ def finalize_auto_run(token, runtime, status, error=None, repo_summary=None):
 
 
 def execute_maintenance_run(token, config, runtime, *, engine=None, source=None, clock=time.time,
-                            timer_clock=time.monotonic):
+                            timer_clock=time.monotonic, source_ids=None):
     """每次只协调一个有限批次；后台调度器接续，不依赖网页轮询。"""
     store = repo_store(token)
     engine = engine or check_engine
@@ -1401,6 +1403,10 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
     state.pop("inflight_type", None)
     state.pop("inflight_inputs", None)
     state.pop("inflight_queue", None)
+    queues = DiscoveryQueues(state, maintenance_source_ids() if source_ids is None else source_ids)
+    update_auto_runtime(token, source_supported_count=len(queues.ids), source_total_count=len(PROXY_SOURCES),
+                        source_last_id=state.get("source_last_id"), source_error=None,
+                        source_last_fetched_at=state.get("source_last_fetched_at"), source_current_id=None)
     selection_snapshot = store.snapshot()
     selection_epoch = selection_snapshot["epoch"]
     work_type, proxies, info = choose_batch(selection_snapshot, state, config, clock())
@@ -1413,38 +1419,56 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
         nonlocal proxies, selection_snapshot
         retry_turn = work_type == "discover" and state.get("discovery_retry_turn") and bool(state.get("retry_candidates"))
         if work_type == "discover":
-            candidates = state.get("retry_candidates", []) if retry_turn else state.get("candidates", [])
-            cursor = 0 if retry_turn else state.get("cursor", 0)
-            if not retry_turn and cursor >= len(candidates):
-                update_auto_runtime(token, stage="fetching")
-                index = state.get("source_index", 0)
-                state["source_index"] = index + 1
-                try:
-                    async with network_budget.lease(token, 1, runtime["stop"]) as slots:
-                        if not slots:
-                            return {}, []
-                        fetched, source_id = await asyncio.to_thread(source, index, runtime["stop"])
-                    if len(fetched) > 50000:
-                        raise ValueError("source capacity")
-                    candidates = normalize_proxy_list(fetched)
-                    state.update(candidates=candidates, cursor=0)
-                    cursor = 0
-                except Exception as exc:
-                    # 不复制外部错误正文／URL；来源失败仍推进源游标，下批先检查到期库存。
-                    update_auto_runtime(token, source_error="来源读取失败（" + type(exc).__name__ + "）")
-                    state.update(candidates=[], cursor=0)
+            if retry_turn:
+                candidates = state.get("retry_candidates", [])
+                proxies = candidates[:config["discover_batch"]]
+                state["retry_candidates"] = candidates[len(proxies):]
+                update_auto_runtime(token, source_current_id="未完成重试", source_count=0)
+            else:
+                key = queues.next_source(clock())
+                if key is None:
                     runtime["next_delay"] = 10
+                    state["discovery_retry_turn"] = True
                     if not runtime["stop"].is_set():
                         await asyncio.to_thread(store.maintenance, state)
                     return {}, []
+                update_auto_runtime(token, source_current_id=key, source_count=0)
+                if not queues.queues.get(key):
+                    update_auto_runtime(token, stage="fetching")
+                    event = {"id": uuid.uuid4().hex, "ok": False, "count": 0}
+                    try:
+                        async with network_budget.lease(token, 1, runtime["stop"]) as slots:
+                            if not slots:
+                                return {}, []
+                            fetched, _ = await asyncio.to_thread(source, queues.ids.index(key), runtime["stop"])
+                        if len(fetched) > 50000:
+                            raise RepositoryError("单个来源超过 50000 候选，未接纳该来源")
+                        candidates = normalize_proxy_list(fetched)
+                        queues.admit(key, candidates, clock())
+                        event.update(ok=True, count=len(candidates))
+                        state.update(source_last_id=key, source_last_fetched_at=int(clock() * 1000))
+                        update_auto_runtime(token, source_count=len(candidates), source_last_id=key,
+                                            source_last_fetched_at=state["source_last_fetched_at"])
+                    except Exception as exc:
+                        # 仅自有容量异常允许展示固定中文；网络异常不复制 URL 或外部错误正文。
+                        error = str(exc) if isinstance(exc, RepositoryError) else "来源读取失败（" + type(exc).__name__ + "）"
+                        update_auto_runtime(token, source_error=error)
+                        queues.cooldowns[key] = clock() + 60
+                        runtime["next_delay"] = 2
+                    if runtime["stop"].is_set():
+                        return {}, []
+                    # 来源队列、轮转位置与抓取计数一起持久化；写盘失败不能伪装成读源失败。
+                    await asyncio.to_thread(store.maintenance, state, source_event=event)
+                    log.info("maintenance source workspace=%s run=%s source=%s ok=%s candidates=%s",
+                             hashlib.sha256(token.encode()).hexdigest()[:10], runtime["run_id"], key,
+                             event["ok"], event["count"])
+                    if not event["ok"]:
+                        state["discovery_retry_turn"] = True
+                        await asyncio.to_thread(store.maintenance, state)
+                        return {}, []
+                proxies = queues.take(key, config["discover_batch"])
             if runtime["stop"].is_set():
                 return {}, []
-            end = min(len(candidates), cursor + config["discover_batch"])
-            proxies = candidates[cursor:end]
-            if retry_turn:
-                state["retry_candidates"] = candidates[end:]
-            else:
-                state["cursor"] = end
             selection_snapshot = await asyncio.to_thread(store.snapshot)
             # 抓取期间的人工修改同样使本批失效，不能在抓取结束后领取新代次。
             selection_snapshot["epoch"] = selection_epoch
@@ -1455,8 +1479,7 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
             proxies = [p for p in proxies if proxy_key(p) not in checked and proxy_key(p) not in existing_keys]
             state["discovery_retry_turn"] = not retry_turn
             update_auto_runtime(token, skipped=before - len(proxies),
-                                discovery_pending=len(candidates) - end + (0 if retry_turn else len(state.get("retry_candidates", []))),
-                                source_count=len(candidates))
+                                discovery_pending=discovery_pending(state))
         if runtime["stop"].is_set():
             return {}, []
         # 先存游标及在途输入：进程退出后不重放内存成功观测，输入回到有界队尾。
@@ -1465,10 +1488,11 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
         await asyncio.to_thread(store.maintenance, state)
         update_auto_runtime(token, total=len(proxies), input_count=len(proxies), stage="detecting")
         if not proxies:
-            runtime["next_delay"] = 5
+            runtime.setdefault("next_delay", 5)
             return {}, []
         context = await asyncio.to_thread(store.begin, runtime["run_id"], profile,
-                                          runtime.get("config_generation", 0), proxies, snapshot=selection_snapshot)
+                                          runtime.get("config_generation", 0), proxies, snapshot=selection_snapshot,
+                                          work_type=work_type)
         if context is None:
             state.pop("inflight_type", None)
             state.pop("inflight_inputs", None)
@@ -1480,14 +1504,14 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
             batch = IncrementalBatch(store, engine, network_budget, token, config, context, runtime["stop"],
                                      make_observation, lambda r: publish_auto_result(token, r),
                                      lambda **s: update_auto_runtime(token, **s), clock=timer_clock)
+            batch_started = timer_clock()
             summary, completed = await batch.run(proxies)
+            if work_type == "refresh":
+                state["refresh_spent_seconds"] = state.get("refresh_spent_seconds", 0) + max(0, timer_clock() - batch_started)
             complete_keys = set(map(proxy_key, completed))
             unfinished = [p for p in proxies if proxy_key(p) not in complete_keys]
             if work_type == "discover":
-                # 来源向前消费，慢项进入独立有界队列；重试批次和来源批次交替。
-                if not retry_turn:
-                    rest = state.get("candidates", [])[state.get("cursor", 0):]
-                    state.update(candidates=rest, cursor=0)
+                # 来源已前进到下一队列；慢项独立重试，不绑定任何来源的尾部。
                 queue_retry(unfinished)
             else:
                 retry = state.setdefault("retry_after", {})

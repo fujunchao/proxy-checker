@@ -143,7 +143,8 @@ class AuditBackend(workspace.WorkspaceTest):
                 now[0] += 121
                 await asyncio.Event().wait()
         for i in range(2):
-            s.execute_maintenance_run(token, self.config(refresh_batch=1), self.runtime(token, f"slow_{i}"),
+            # 此处单独验证存量轮转；发现时间保底由 test_discovery_fairness 独立覆盖。
+            s.execute_maintenance_run(token, self.config(refresh_batch=1, refresh_budget_seconds=600), self.runtime(token, f"slow_{i}"),
                                       engine=Engine(), clock=lambda: now[0], timer_clock=lambda: now[0])
         self.assertEqual(seen, [item(1)["proxy"], item(2)["proxy"]], "跨过 120 秒预算后不能继续选同一最老前缀")
         self.assertTrue(all("last_checked_at" not in row for row in store.snapshot()["items"]))

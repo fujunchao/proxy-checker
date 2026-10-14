@@ -313,10 +313,11 @@ class CoordinatorRegression(unittest.TestCase):
             runtime = {"run_id": "discover_" + str(n), "stop": threading.Event(), "results": [], "counts": [0, 0, 0]}
             server.auto_runtime[token] = runtime
             # 排期时间在完成后一秒，已完成库存尚未到期。
-            server.execute_maintenance_run(token, cfg, runtime, engine=Engine(), source=source, clock=lambda: 3)
+            server.execute_maintenance_run(token, cfg, runtime, engine=Engine(), source=source, clock=lambda: 3,
+                                           source_ids=["synthetic"])
             server._repository.cache_clear()
         self.assertEqual(seen, [item(i)["proxy"] for i in (2, 3, 4)])
-        self.assertEqual(server.repo_store(token).maintenance()["candidates"], [])
+        self.assertEqual(server.repo_store(token).maintenance()["source_queues"]["synthetic"], [])
         server.auto_runtime.pop(token)
 
     def test_old_configuration_is_not_enabled_or_forced(self):
@@ -463,4 +464,6 @@ if __name__ == "__main__":
     try:
         unittest.main()
     finally:
+        import logging
+        logging.shutdown()
         TEMP.cleanup()

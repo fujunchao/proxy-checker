@@ -27,11 +27,20 @@ progress.id = 'autoProgress';
 w.document.body.appendChild(progress);
 w.acceptAutoStatus({config: {enabled: true, maintenance_mode: 'continuous', target_profile: 'zai', detect_mode: 'skip'},
   state: {running: true, work_type: 'refresh', done: 1, total: 2, due_count: 9,
-    unknown_age_count: 3, oldest_refresh_age_seconds: 1800, repo_count: 8, repo_revision: 8},
+    unknown_age_count: 3, oldest_refresh_age_seconds: 1800, repo_count: 8, repo_revision: 8,
+    source_count: 0, source_supported_count: 22, source_total_count: 33,
+    source_last_id: 'databay_http', source_last_fetched_at: 2000000,
+    maintenance_totals: {since: 1000000, source_fetches: 2, source_candidates: 7200,
+      discover_checked: 300, refresh_checked: 100, repo_added: 85, repo_removed: 29}},
   results_session_id: 'new-run', results_total: 0});
 assert.match(w.document.getElementById('autoStatusBadge').textContent, /存量复测中/);
 assert.match(w.document.getElementById('autoProgress').innerHTML, /存量到期 9/);
 assert.match(w.document.getElementById('autoProgress').innerHTML, /版本 8/);
+assert.match(w.document.getElementById('autoProgress').textContent, /累计新增 85/);
+assert.match(w.document.getElementById('autoProgress').textContent, /累计移除 29/);
+assert.match(w.document.getElementById('autoProgress').textContent, /来源覆盖 22\/33/);
+assert.match(w.document.getElementById('autoProgress').textContent, /最近抓取.*databay_http/);
+assert.match(w.document.getElementById('autoProgress').textContent, /本批新拉取 0/);
 b.reply(pending, {config: {enabled: false}, state: {}, new: []});
 assert.equal(w.autoStatusCache.config.enabled, true, '旧摘要不能覆盖更新的配置响应');
 

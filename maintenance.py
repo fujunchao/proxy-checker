@@ -4,7 +4,63 @@ from collections import deque
 from contextlib import asynccontextmanager
 import threading
 import time
-from repository import endpoint
+from repository import endpoint, RepositoryError
+
+
+MAX_SOURCE_CANDIDATES = 100000
+SOURCE_REFETCH_SECONDS = 300
+
+
+def discovery_pending(state):
+    return (sum(len(q) for q in state.get("source_queues", {}).values())
+            + max(0, len(state.get("candidates", [])) - state.get("cursor", 0))
+            + len(state.get("retry_candidates", [])))
+
+
+class DiscoveryQueues:
+    """来源独立游标：一批就轮转，读源与检测分离，所有已接纳输入可恢复。"""
+    def __init__(self, state, source_ids):
+        self.state = state
+        self.ids = list(source_ids)
+        self.queues = state.setdefault("source_queues", {})
+        # 旧版仅有一个候选队列；归还给最近读取的来源，下一源仍可立即获得机会。
+        legacy = state.get("candidates", [])[state.get("cursor", 0):]
+        if legacy:
+            previous = max(0, state.get("source_index", 0) - 1) % len(self.ids) if self.ids else 0
+            key = self.ids[previous] if self.ids else "legacy_retired"
+            self.queues[key] = list(dict.fromkeys(self.queues.get(key, []) + legacy))
+        state.update(candidates=[], cursor=0)
+        # 来源删除后仍排空已接纳候选，但不再次抓取退役来源。
+        self.ring = self.ids + sorted(k for k, q in self.queues.items() if q and k not in self.ids)
+        self.cooldowns = state.setdefault("source_cooldowns", {})
+
+    def next_source(self, now):
+        if not self.ring:
+            return None
+        start = self.state.get("source_next", self.ring[self.state.get("source_index", 0) % len(self.ring)])
+        offset = self.ring.index(start) if start in self.ring else 0
+        for step in range(len(self.ring)):
+            pos = (offset + step) % len(self.ring)
+            key = self.ring[pos]
+            if self.queues.get(key) or (key in self.ids and self.cooldowns.get(key, 0) <= now):
+                self.state["source_next"] = self.ring[(pos + 1) % len(self.ring)]
+                self.state["source_index"] = self.state.get("source_index", 0) + 1
+                return key
+        return None
+
+    def admit(self, key, candidates, now):
+        if len(candidates) > 50000:
+            raise RepositoryError("单个来源超过 50000 候选，未接纳该来源")
+        if sum(map(len, self.queues.values())) + len(candidates) > MAX_SOURCE_CANDIDATES:
+            raise RepositoryError("来源队列容量不足，未接纳该来源；其他来源继续轮转")
+        self.queues[key] = candidates
+        self.cooldowns[key] = now + SOURCE_REFETCH_SECONDS
+
+    def take(self, key, limit):
+        candidates = self.queues.get(key, [])
+        selected = candidates[:limit]
+        self.queues[key] = candidates[limit:]
+        return selected
 
 
 class FairBudget:
@@ -198,8 +254,11 @@ def choose_batch(snapshot, state, config, now):
             "oldest_checked_at": min(known) if known else None,
             "migration_required": sum(1 for i in snapshot["items"] if not i.get("target_profile")),
             "other_profile_count": sum(1 for i in snapshot["items"] if i.get("target_profile") not in (None, profile)),
-            "discovery_pending": max(0, len(state.get("candidates", [])) - state.get("cursor", 0)) + len(state.get("retry_candidates", []))}
-    if untried and state.get("refresh_streak", 0) < config["refresh_share"]:
+            "discovery_pending": discovery_pending(state)}
+    streak = state.get("refresh_streak", 0)
+    sparse = len(untried) <= min(10, config["refresh_batch"] // 4)
+    within_time = state.get("refresh_spent_seconds", 0) < config.get("refresh_budget_seconds", 120)
+    if untried and streak < config["refresh_share"] and within_time and not (streak and sparse):
         selected = [i["proxy"] for i in untried[:config["refresh_batch"]]]
         for p in selected:
             retry[endpoint(p)] = now + min(60, interval)
@@ -208,4 +267,5 @@ def choose_batch(snapshot, state, config, now):
         state["refresh_streak"] = state.get("refresh_streak", 0) + 1
         return "refresh", selected, info
     state["refresh_streak"] = 0
+    state["refresh_spent_seconds"] = 0
     return "discover", [], info
