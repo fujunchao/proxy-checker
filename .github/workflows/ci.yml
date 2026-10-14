@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+# 显式 bash 启用 pipefail，避免 tee 把失败测试伪装成成功。
+defaults:
+  run:
+    shell: bash
+
 jobs:
   regression:
     name: 后端、前端和完整冒烟测试
