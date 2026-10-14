@@ -413,10 +413,10 @@ class CoordinatorRegression(unittest.TestCase):
             async def check_proxy_full_async(self, *args, **kwargs):
                 raise asyncio.TimeoutError()
         results = []
-        asyncio.run(HalfRound(CheckConfig(timeout=1, detect_timeout=1)).check_many_async(
+        asyncio.run(HalfRound(CheckConfig(timeout=1, detect_timeout=1, check_rounds=2)).check_many_async(
             [item(1)["proxy"]], stopped, 2, 1, results.append, "generic"))
         self.assertEqual(results, [])
-        asyncio.run(HardTimeout(CheckConfig(timeout=1, detect_timeout=1)).check_many_async(
+        asyncio.run(HardTimeout(CheckConfig(timeout=1, detect_timeout=1, check_rounds=2)).check_many_async(
             [item(1)["proxy"]], threading.Event(), 2, 1, results.append, "generic"))
         self.assertEqual(results[0]["grade"], "F")
         self.assertTrue(results[0]["terminal_complete"])

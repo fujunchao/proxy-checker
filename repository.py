@@ -237,7 +237,8 @@ class Repository:
                 if self.matches(result, policy):
                     updated = self.convert({**result, "completed_at": observation["completed_at"]}, existing)
                     updated["last_checked_at"] = observation["completed_at"]
-                    rows.pop(key, None)
+                    if dest != key:
+                        rows.pop(key, None)
                     rows[dest] = updated
                     data["versions"].pop(key, None)
                     data["versions"][dest] = data["revision"] + 1
