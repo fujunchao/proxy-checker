@@ -1545,7 +1545,8 @@ def execute_auto_run(token, config, run_id, reason):
             }
         log.error("maintenance failed workspace=%s run=%s stage=%s error_type=%s",
                   hashlib.sha256(token.encode()).hexdigest()[:10], run_id, runtime.get("stage"), type(exc).__name__)
-        finalize_auto_run(token, runtime, "failed", error="维护失败（" + type(exc).__name__ + "），请检查状态和备份")
+        finalize_auto_run(token, runtime, "failed", error=(str(exc) if isinstance(exc, RepositoryError) else
+                          "维护失败（" + type(exc).__name__ + "），请检查状态和备份"))
     finally:
         try:
             repo_store(token).finish(run_id)
@@ -1960,7 +1961,7 @@ class Handler(SimpleHTTPRequestHandler):
                     self.send_response(404)
                     self.end_headers()
                     return
-                if repo_export_filtered(params):
+                if repo_export_filtered(params) and not (ext == "json" and snapshot.get("legacy_json_missing")):
                     items = filter_repo_for_export(compact_repo(snapshot["items"]), params)
                     content = (json.dumps(items, ensure_ascii=False) if ext == "json" else
                                render_repo_txt(items, comment=truthy_param((params.get("comment") or [""])[0])))

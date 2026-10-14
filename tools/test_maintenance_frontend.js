@@ -2,6 +2,8 @@
 const assert = require('node:assert/strict');
 const {browser, bind} = require('./test_workspace_frontend');
 const {JSDOM} = require('jsdom');
+const fs = require('node:fs');
+const path = require('node:path');
 const b = browser();
 bind(b, 'maintenance_ui');
 const w = b.context;
@@ -18,8 +20,11 @@ assert.equal(w.readRepoSyncMeta().revision, 8);
 
 const pending = b.requests.find(r => r.url.endsWith('/api/auto/status'));
 // 渲染断言使用真实 DOM 转义语义，不使用仅用于时序测试的简化节点。
-const dom = new JSDOM('<div id="autoProgress"></div><span id="autoStatusBadge"></span>');
+const dom = new JSDOM(fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8'));
 w.document = dom.window.document;
+const progress = w.document.createElement('div');
+progress.id = 'autoProgress';
+w.document.body.appendChild(progress);
 w.acceptAutoStatus({config: {enabled: true, maintenance_mode: 'continuous', target_profile: 'zai', detect_mode: 'skip'},
   state: {running: true, work_type: 'refresh', done: 1, total: 2, due_count: 9,
     unknown_age_count: 3, oldest_refresh_age_seconds: 1800, repo_count: 8, repo_revision: 8},

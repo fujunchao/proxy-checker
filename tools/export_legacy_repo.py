@@ -19,7 +19,7 @@ def export_snapshot(snapshot_path, output_path):
         envelope = json.load(f)
     data = envelope["data"]
     if (hashlib.sha256(encode(data)).hexdigest() != envelope["sha256"]
-            or data["format"] != 1 or json.loads(data["json"]) != data["items"]):
+            or data["format"] != 1 or (not data.get("legacy_json_missing") and json.loads(data["json"]) != data["items"])):
         raise ValueError("快照校验失败，未导出")
     suffix = ".snapshot.json"
     if not source.name.endswith(suffix):
@@ -28,7 +28,9 @@ def export_snapshot(snapshot_path, output_path):
     output.parent.mkdir(parents=True, exist_ok=True)
     staged = output.with_name(output.name + ".staging-" + uuid.uuid4().hex)
     staged.mkdir()
-    files = {token + ".json": data["json"], token + ".txt": data["txt"] or ""}
+    # 显式回退导出把 TXT-only 的逻辑库存写成 JSON，避免旧版优先读取空 JSON 而忽略 TXT。
+    json_text = json.dumps(data["items"], ensure_ascii=False) if data.get("legacy_json_missing") else data["json"]
+    files = {token + ".json": json_text, token + ".txt": data["txt"] or ""}
     manifest = {"repo_revision": data["revision"], "count": len(data["items"]),
                 "sha256": {k: hashlib.sha256(v.encode()).hexdigest() for k, v in files.items()}}
     files["manifest.json"] = json.dumps(manifest, ensure_ascii=False, indent=2)

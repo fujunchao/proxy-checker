@@ -128,6 +128,36 @@ class RepositoryRegression(unittest.TestCase):
             self.assertEqual(len([f for f in os.listdir(store.directory) if f.startswith(store.token + ".snapshot")]),
                              1 if stage == "committed" or stage in ("json", "txt", "metadata") else 2)
 
+    def test_post_commit_failure_retry_does_not_repeat_streak(self):
+        store = self.store()
+        context = self.context(store)
+        obs = self.observation(context)
+        def crash(stage):
+            if stage == "committed":
+                raise OSError("synthetic crash after rename")
+        store.fault = crash
+        with self.assertRaises(OSError):
+            store.publish(context, [obs], "stable_only")
+        store.fault = lambda _: None
+        self.assertEqual(store.publish(context, [obs], "stable_only")["duplicates"], 1)
+        self.assertEqual(store.snapshot()["items"][0]["pass_streak"], 1)
+
+    def test_legacy_txt_only_and_mismatched_pair(self):
+        store = self.store()
+        with open(os.path.join(store.directory, store.token + ".txt"), "w") as f:
+            f.write(item(1)["proxy"])
+        self.assertEqual(store.snapshot()["json"], "[]", "旧版缺 JSON 时公共 JSON 返回空数组")
+        self.assertEqual(len(store.snapshot()["items"]), 1, "内部仍能读入旧 TXT 库存")
+        self.context(store)
+        self.assertEqual(store.snapshot()["json"], "[]")
+        store2 = self.store("legacy_mismatch")
+        with open(os.path.join(store2.directory, store2.token + ".json"), "w") as f:
+            json.dump([item(1)], f)
+        with open(os.path.join(store2.directory, store2.token + ".txt"), "w") as f:
+            f.write(item(2)["proxy"])
+        with self.assertRaises(server.RepositoryError):
+            store2.begin("bad", "generic", 0, [])
+
     def test_corrupt_legacy_and_snapshot_do_not_become_empty(self):
         store = self.store()
         legacy = os.path.join(store.directory, store.token + ".json")

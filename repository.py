@@ -65,7 +65,7 @@ class Repository:
                 if (data["format"] != 1 or not isinstance(data["items"], list)
                         or not isinstance(data["revision"], int) or not isinstance(data["runs"], dict)
                         or not isinstance(data["versions"], dict) or not isinstance(data["maintenance"], dict)
-                        or json.loads(data["json"]) != data["items"]):
+                        or (not data.get("legacy_json_missing") and json.loads(data["json"]) != data["items"])):
                     raise ValueError("schema")
                 self._cached, self._stamp = data, stamp
                 return data
@@ -88,13 +88,15 @@ class Repository:
                     raise ValueError("legacy txt")
                 if not os.path.exists(json_path):
                     items = [{"proxy": p.strip()} for p in txt.splitlines() if p.strip()]
-                    raw = json.dumps(items, ensure_ascii=False)
+                elif [endpoint(i["proxy"]) for i in self.compact(items)] != [endpoint(p) for p in txt.splitlines() if p.strip()]:
+                    raise ValueError("legacy exports disagree")
         except (ValueError, OSError) as exc:
             raise RepositoryError("旧仓库不可读，禁止按空仓库覆盖") from exc
         # 旧无参数导出保留原正文。首次数据修改时才标准化。
         return {"format": 1, "revision": 0, "epoch": 0, "items": items,
                 "json": raw, "txt": txt, "versions": {endpoint(i["proxy"]): 0 for i in self.compact(items)},
-                "runs": {}, "maintenance": {}, "last_published_at": None}
+                "runs": {}, "maintenance": {}, "last_published_at": None,
+                "legacy_json_missing": not os.path.exists(json_path)}
 
     def snapshot(self):
         with self.lock:
@@ -112,6 +114,7 @@ class Repository:
             if len(items) > MAX_ITEMS:
                 raise RepositoryError("仓库容量已达上限，未丢弃任何记录")
             data["items"] = self.annotate(self.compact(items))
+            data["legacy_json_missing"] = False
             self.fault("json")
             data["json"] = json.dumps(data["items"], ensure_ascii=False)
             self.fault("txt")
