@@ -16,7 +16,7 @@ BOOT_ID = uuid.uuid4().hex
 LOCKS = [threading.RLock() for _ in range(64)]
 MAX_ITEMS = 100000
 MAX_BYTES = 64 * 1024 * 1024
-MAX_OBSERVATIONS = 50000
+MAX_OBSERVATIONS = 100000
 
 
 class RepositoryError(RuntimeError):
@@ -152,13 +152,22 @@ class Repository:
             if stale:
                 return None, {"ok": False, "stale_repo": True, "repo_revision": data["revision"],
                               "current_count": len(current), "error": "仓库版本已改变，请刷新后重试"}
-            merged = {endpoint(i["proxy"]): i for i in current} if mode != "replace" else {}
+            current_by_key = {endpoint(i["proxy"]): i for i in current}
+            merged = dict(current_by_key) if mode != "replace" else {}
             for item in incoming:
                 key = endpoint(item["proxy"])
                 if mode != "replace" and key in merged and base_revision is None:
                     continue
                 if key in merged:
                     item["added"] = merged[key].get("added", item["added"])
+                previous = current_by_key.get(key)
+                if previous:
+                    # UI 保存不是复测，不能伪造成功时间／计数，或因旧页面缺字段而抹掉它们。
+                    for field in ("last_ok", "last_checked_at", "pass_streak", "fail_count"):
+                        if field in previous:
+                            item[field] = previous[field]
+                        else:
+                            item.pop(field, None)
                 merged[key] = item
             # 整工作区人工栅栏是保守保护：也跳过同期未被编辑的旧观测，不永久禁止重新发现。
             data["epoch"] += 1

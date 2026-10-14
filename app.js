@@ -33,7 +33,7 @@ var autoStatusCache=null;
 var autoResultsIndex=0;
 var autoSessionId='';
 var autoResultsTotal=0,autoResultsTimer=null,autoPageRequest=null,autoPageGeneration=0;
-var autoSummaryLoading=false;
+var autoSummaryLoading=false,autoSummaryEpoch=0,workspaceEpoch=0;
 var autoRunResultKeys={};
 var autoStopRequestedSession='';
 var autoStopRepoPromptSession='';
@@ -144,6 +144,10 @@ function dedup(){
   toast("去重: "+lines.length+" -> "+unique.length+" 个");
 }
 function post(url,data,cb,timeout){
+  if(url==='/api/repo/save'&&data.base_revision===undefined){
+    var revision=readRepoSyncMeta().revision;
+    if(typeof revision==='number')data.base_revision=revision;
+  }
   var fullUrl=API_BASE+url;
   var xhr=new XMLHttpRequest();xhr.open("POST",fullUrl,true);
   xhr.timeout=timeout||0;
@@ -251,6 +255,13 @@ function logoutAuth(){
   localStorage.removeItem(AUTH_TOKEN_KEY);
   authenticated=false;
   workspaceReady=false;
+  workspaceEpoch++;
+  autoSummaryEpoch++;
+  autoSummaryLoading=false;
+  autoPageGeneration++;
+  autoPageRequest=null;
+  autoSessionId='';autoResultsIndex=0;autoResultsTotal=0;
+  clearTimeout(autoResultsTimer);
   clearTimeout(autoStatusTimer);
   showAuthOverlay();
   toast('已退出');
@@ -1165,8 +1176,9 @@ function readRepoSyncMeta(){
   try{return JSON.parse(localStorage.getItem(REPO_SYNCED_KEY))||{}}catch(e){return {}}
 }
 
-function rememberRepoSync(count){
-  try{localStorage.setItem(REPO_SYNCED_KEY,JSON.stringify({count:Number(count)||0,time:Date.now()}))}catch(e){}
+function rememberRepoSync(count,revision){
+  if(revision===undefined)revision=readRepoSyncMeta().revision;
+  try{localStorage.setItem(REPO_SYNCED_KEY,JSON.stringify({count:Number(count)||0,time:Date.now(),revision:revision}))}catch(e){}
 }
 
 function getRepoBaseCount(repo){
@@ -1191,6 +1203,9 @@ function compactRepoItem(p){
   if(p.target_name)item.target_name=p.target_name;
   item.added=p.added||Date.now();
   item.updated=p.updated||item.added;
+  ['usable','usable_reason','aux_reachable','protocol_note','last_ok','last_checked_at','pass_streak','fail_count','ip_shared'].forEach(function(k){
+    if(p[k]!==undefined&&p[k]!==null)item[k]=p[k];
+  });
   return item;
 }
 
@@ -1226,6 +1241,7 @@ function initializeWorkspace(fixedToken){
     workspaceReady=true;
     return true;
   }
+  workspaceEpoch++;
   serverWorkspaceToken=fixedToken;
   // 固定身份使用独立缓存，避免新窗口原有的仓库/检测历史误写入指定身份。
   // 仅当浏览器原本就是该身份时，才复制旧格式缓存；原缓存保留，切回旧模式仍可用。
@@ -1319,11 +1335,12 @@ function autoStatusText(data){
   var state=(data&&data.state)||{};
   var config=(data&&data.config)||{};
   if(!autoModeAvailable)return '自动不可用';
+  if(state.status==='unknown')return '正在读取自动任务状态';
   if(state.running){
     if(state.stage==='fetching')return '自动拉取中';
     if(state.stage==='loading_repo')return '自动合并中';
     if(state.stage==='stopping')return '自动停止中 '+(state.done||0)+'/'+(state.total||0);
-    return '自动检测中 '+(state.done||0)+'/'+(state.total||0);
+    return (config.maintenance_mode==='continuous'?(state.work_type==='refresh'?'存量复测中 ':'增量发现中 '):'自动检测中 ')+(state.done||0)+'/'+(state.total||0);
   }
   if(!config.enabled)return '自动未开启';
   if(state.status==='failed')return '自动上次失败';
@@ -1386,6 +1403,10 @@ function processAutoRealtimeResults(data){
   var changed=false;
   if(incoming.length){
     changed=upsertResults(incoming);
+    if(data.config&&data.config.maintenance_mode==='continuous'){
+      // 长期循环只保留各分类最近 1000 条诊断，不累积无限历史；订阅仓库不受影响。
+      V=V.slice(-1000);U=U.slice(-1000);F=F.slice(-1000);
+    }
     incoming.forEach(function(result){
       var key=resultKey(result);
       if(!key)return;
@@ -1407,7 +1428,8 @@ function processAutoRealtimeResults(data){
     refreshRepoAfterAuto(state.last_summary);
   }
   autoLastRunning=!!state.running;
-  if(!state.running&&state.status==='stopped'&&autoResultsIndex>=autoResultsTotal){
+  if(!state.running&&state.status==='stopped'&&autoResultsIndex>=autoResultsTotal&&
+     !(data.config&&data.config.maintenance_mode==='continuous')){
     maybePromptAutoStoppedRepo(sessionId||autoStopRequestedSession);
   }
 }
@@ -1441,6 +1463,12 @@ function startAutoPolling(delay){
 }
 
 function acceptAutoStatus(data){
+  autoSummaryEpoch++;
+  autoSummaryLoading=false;
+  var revision=data.state&&data.state.repo_revision;
+  if(typeof revision==='number'&&revision!==readRepoSyncMeta().revision){
+    loadRepoFromServer(null,{replaceEmpty:true});
+  }
   if(Object.prototype.hasOwnProperty.call(data,'results_session_id')){
     var session=data.results_session_id||'';
     if(session!==autoSessionId){
@@ -1498,7 +1526,9 @@ function loadAutoStatus(callback){
   }
   if(autoSummaryLoading)return;
   autoSummaryLoading=true;
+  var requestEpoch=autoSummaryEpoch,identityEpoch=workspaceEpoch;
   post('/api/auto/status',{token:getUserToken(),since:autoResultsIndex,session_id:autoSessionId,summary_only:true},function(err,res){
+    if(requestEpoch!==autoSummaryEpoch||identityEpoch!==workspaceEpoch||!authenticated)return;
     autoSummaryLoading=false;
     if(!err&&res&&!res.error){
       acceptAutoStatus(res);
@@ -1554,6 +1584,17 @@ function renderAutoProgress(data){
   var html='';
   html+='<div>状态: '+esc(autoStatusText(data))+'</div>';
   html+='<div>阶段: '+esc(stageMap[state.stage]||state.stage||'-')+'</div>';
+  html+='<div>自动任务档位: '+esc(config.target_profile||'未知')+' · 发现策略: '+esc(config.detect_mode||'未知')+'（与手动按钮独立）</div>';
+  if(config.maintenance_mode==='continuous'){
+    function value(v){return v===undefined||v===null?'未知':esc(v)}
+    html+='<div>存量到期 '+value(state.due_count)+' · 最老已知复测年龄 '+value(state.oldest_refresh_age_seconds)+' 秒 · 时间未知 '+value(state.unknown_age_count)+'</div>';
+    html+='<div>发现队列 '+value(state.discovery_pending)+' · 待发布 '+value(state.pending_count)+' · 任务级未完成 '+value(state.incomplete_count)+'</div>';
+    html+='<div>已发布仓库 '+value(state.repo_count)+' · 版本 '+value(state.repo_revision)+' · 最近发布 '+(state.last_published_at?esc(formatAutoTime(state.last_published_at/1000,tz)):'尚无发布')+'</div>';
+    html+='<div>本批提交: 新增 '+value(state.repo_added)+' / 更新 '+value(state.repo_updated)+' / 移除 '+value(state.repo_removed)+' / 冲突跳过 '+value(state.conflict_skipped)+'</div>';
+    html+='<div>缺少档位待人工确认 '+value(state.migration_required)+' · 其他档位保留 '+value(state.other_profile_count)+'</div>';
+    html+='<div>目标间隔不是时限保证；页面仅保留各分类最近 1000 条诊断，检测通过不等于已提交。</div>';
+    if(state.source_error)html+='<div>'+esc(state.source_error)+'；下批仍优先检查存量。</div>';
+  }
   html+='<div>计划时区: '+esc(tz)+'</div>';
   html+='<div>当前时间: '+esc((data.server_time&&data.server_time.text)||formatAutoTime((data.server_time&&data.server_time.timestamp),tz))+'</div>';
   if(data.server_time&&data.server_time.server_text&&data.server_time.server_text!==data.server_time.text)html+='<div>服务器本地: '+esc(data.server_time.server_text)+' '+esc(data.server_time.server_timezone||'')+'</div>';
@@ -1583,7 +1624,7 @@ function openAutoSettings(){
     toast('当前部署不支持后台自动任务');
     return;
   }
-  showAutoModal(autoStatusCache||{config:{enabled:false,target_profile:currentTargetProfile,detect_mode:'skip',repo_update_policy:'stable_only'},state:{status:'idle',running:false}});
+  showAutoModal(autoStatusCache||{config:{target_profile:currentTargetProfile},state:{status:'unknown'}});
   post('/api/auto/get',{token:getUserToken(),since:autoResultsIndex,session_id:autoSessionId,summary_only:true},function(err,res){
     if(!document.querySelector('.modal-overlay[data-modal=\"auto\"]'))return;
     if(err||res.error){
@@ -1611,12 +1652,14 @@ function showAutoModal(data){
   html+='<div class="settings-note">启用后台自动检测：保存后服务器会按时间规则自动跑，不需要浏览器一直打开。立即运行：不等下次计划时间，马上跑一轮；是否启用定时由上面的勾选决定。</div>';
   html+='<div class="auto-form">';
   html+='<div class="auto-field full"><label><input id="autoEnabled" type="checkbox" '+(config.enabled?'checked':'')+' style="width:auto;height:auto;margin-right:8px">启用后台自动检测</label></div>';
+  html+='<div class="auto-field full"><label>运行方式</label><select id="autoMaintenanceMode"><option value="legacy">旧模式：按计划完成整轮后发布</option><option value="continuous">持续维护（推荐）：存量优先、发现分批、中途发布</option></select></div>';
+  html+='<div class="auto-field full"><div class="settings-note">持续维护：存量目标 15 分钟复测一次，不受已检测历史跳过；每批存量最多 100 / 发现最多 200，预算 120 秒，每 20 条或 10 秒发布。旧时间规则仅旧模式生效；停止后等待再次保存或立即运行。</div></div>';
   html+='<div class="auto-field"><label>时间规则</label><select id="autoScheduleType" onchange="updateAutoScheduleFields()"><option value="interval" '+(config.schedule_type==='interval'?'selected':'')+'>每隔 N 小时</option><option value="daily" '+(config.schedule_type==='daily'?'selected':'')+'>每天固定时间</option></select></div>';
   html+='<div class="auto-field" id="autoIntervalField"><label>间隔小时</label><input id="autoIntervalHours" type="number" min="0.01" max="720" step="0.25" value="'+esc(config.interval_hours||6)+'"></div>';
   html+='<div class="auto-field" id="autoDailyField"><label>固定时间（计划时区）</label><input id="autoDailyTime" type="time" value="'+esc(config.daily_time||'03:00')+'"></div>';
   html+='<div class="auto-field"><label>计划时区</label><select id="autoTimezone">'+timezoneOptions(config.timezone||appSettings.timezone)+'</select></div>';
-  html+='<div class="auto-field"><label>检测模式</label><select id="autoTargetProfile">'+autoProfileOptions(config.target_profile||currentTargetProfile)+'</select></div>';
-  html+='<div class="auto-field"><label>检测范围</label><select id="autoDetectMode"><option value="skip">只检测新代理</option><option value="force">强制检测全部</option></select></div>';
+  html+='<div class="auto-field"><label>自动任务目标档位</label><select id="autoTargetProfile">'+autoProfileOptions(config.target_profile||currentTargetProfile)+'</select></div>';
+  html+='<div class="auto-field"><label>发现检测范围（不影响存量刷新）</label><select id="autoDetectMode"><option value="skip">只检测新代理</option><option value="force">强制检测全部</option></select></div>';
   html+='<div class="auto-field full"><label>入库策略</label><select id="autoRepoPolicy"><option value="stable_only">只入库稳定可用(A/B)，复测失败旧代理会删除</option><option value="target_only">只入库本档目标可用(usable)，最严格</option><option value="include_unstable">包含不稳定(A/B/C/D)，复测失败旧代理会删除</option><option value="archive_all">所有结果都留档，失效代理也保留</option></select></div>';
   html+='<div class="auto-field full"><div class="settings-note">本轮自动检测使用全局设置：'+esc(getRoundsValue())+' 轮，并发 '+esc(getConcurrentValue())+'。要修改请打开“设置”。</div></div>';
   html+='</div>';
@@ -1628,6 +1671,7 @@ function showAutoModal(data){
   html+='</div></div>';
   overlay.innerHTML=html;
   document.body.appendChild(overlay);
+  document.getElementById('autoMaintenanceMode').value=config.maintenance_mode||'legacy';
   document.getElementById('autoDetectMode').value=config.detect_mode||'skip';
   document.getElementById('autoRepoPolicy').value=config.repo_update_policy||'stable_only';
   updateAutoScheduleFields();
@@ -1644,7 +1688,8 @@ function updateAutoScheduleFields(){
 }
 
 function readAutoConfigFromModal(){
-  return {
+  return Object.assign({},(autoStatusCache&&autoStatusCache.config)||{},{
+    maintenance_mode:document.getElementById('autoMaintenanceMode').value,
     enabled:!!document.getElementById('autoEnabled').checked,
     schedule_type:document.getElementById('autoScheduleType').value,
     interval_hours:parseFloat(document.getElementById('autoIntervalHours').value)||6,
@@ -1655,7 +1700,7 @@ function readAutoConfigFromModal(){
     max_concurrent:getConcurrentValue(),
     detect_mode:document.getElementById('autoDetectMode').value,
     repo_update_policy:document.getElementById('autoRepoPolicy').value
-  };
+  });
 }
 
 function saveAutoSettings(){
@@ -1901,7 +1946,7 @@ function syncRepoToServer(repoOverride){
       return;
     }
     if(!err&&res&&res.ok){
-      rememberRepoSync(res.count);
+      rememberRepoSync(res.count,res.repo_revision);
       updateCloudRepoCount();
     }
   });
@@ -1917,7 +1962,7 @@ function syncRepoReplace(repo,baseCount,callback){
       loadRepoFromServer(function(){if(callback)callback(null,res)});
       return;
     }
-    if(res&&res.ok)rememberRepoSync(res.count);
+    if(res&&res.ok)rememberRepoSync(res.count,res.repo_revision);
     if(callback)callback(null,res);
   });
 }
@@ -1928,21 +1973,29 @@ function markRepoManuallyCleared(){
 
 function loadRepoFromServer(callback,options){
   options=options||{};
-  var token=getUserToken();
+  var token=getUserToken(),identityEpoch=workspaceEpoch;
+  function readRevision(xhr,count){
+    if(!xhr.getResponseHeader)return;
+    var header=xhr.getResponseHeader('X-Repo-Revision');
+    if(header!==null&&header!=='')rememberRepoSync(count,Number(header));
+  }
   function tryLoadJson(t,cb){
     var xhr=new XMLHttpRequest();
     xhr.open('GET',API_BASE+'/api/repo/'+t+'.json',true);
     xhr.onload=function(){
+      if(identityEpoch!==workspaceEpoch||token!==getUserToken()||!authenticated)return;
       if(xhr.status===200){
         try{
           var data=JSON.parse(xhr.responseText);
+          if(Array.isArray(data))readRevision(xhr,data.length);
           if(Array.isArray(data)&&data.length>0){cb(data.length,data);return}
         }catch(e){}
         // Fallback to txt
         tryLoadTxt(t,cb);
-      }else{tryLoadTxt(t,cb)}
+      }else if(xhr.status===503){cb(0,null,'仓库状态损坏，保留缓存');}
+      else{tryLoadTxt(t,cb)}
     };
-    xhr.onerror=function(){tryLoadTxt(t,cb)};
+    xhr.onerror=function(){if(identityEpoch===workspaceEpoch)tryLoadTxt(t,cb)};
     xhr.send();
   }
   function tryLoadTxt(t,cb){
@@ -1962,6 +2015,7 @@ function loadRepoFromServer(callback,options){
     xhr.send();
   }
   tryLoadJson(token,function(count,repo,err){
+    if(identityEpoch!==workspaceEpoch||token!==getUserToken()||!authenticated)return;
     if(err){
       toast('云端仓库读取失败，保留本地缓存');
       if(callback)callback(0);
@@ -2556,7 +2610,7 @@ function saveRepoToCloud(){
       return;
     }
     if(res&&res.ok){
-      rememberRepoSync(res.count);
+      rememberRepoSync(res.count,res.repo_revision);
       updateCloudRepoCount();
       toast('已保存 '+res.count+' 个代理到云端');
     }
@@ -2715,7 +2769,7 @@ function getRepoLink(button){
       return;
     }
     if(err||!res||res.error){toast('同步失败: '+(err||(res&&res.error)||'无响应'));return}
-    rememberRepoSync(res.count);
+    rememberRepoSync(res.count,res.repo_revision);
     repoLinkToken=token;
     var txtUrl=API_BASE+'/api/repo/'+token+'.txt';
     var jsonUrl=API_BASE+'/api/repo/'+token+'.json';

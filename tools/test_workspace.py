@@ -28,7 +28,7 @@ class WorkspaceTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="proxy-checker-workspace-")
         cls.root = Path(cls.tmp.name).resolve()
         assert cls.root.is_relative_to(Path(tempfile.gettempdir()).resolve())
-        for name in ("server.py", "proxy_check.py", "fetch_proxies.py", "config.json",
+        for name in ("server.py", "proxy_check.py", "fetch_proxies.py", "repository.py", "maintenance.py", "config.json",
                      "app.js", "index.html", "login.html"):
             shutil.copy2(ROOT / name, cls.root / name)
         cls.env = patch.dict(os.environ, {"WORKSPACE_TOKEN": FIXED, "AUTH_PASSWORD": "workspace-test",

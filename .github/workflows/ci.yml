@@ -39,7 +39,7 @@ jobs:
       - name: 语法与前端回归
         run: |
           mkdir -p artifacts
-          python -m py_compile server.py proxy_check.py tools/test_workspace.py tools/smoke.py
+          python -m py_compile server.py proxy_check.py repository.py maintenance.py tools/test_workspace.py tools/smoke.py
           node --check app.js
           node tools/test_workspace_frontend.js 2>&1 | tee artifacts/frontend.log
           node tools/test_result_performance.js 2>&1 | tee artifacts/result-performance.log

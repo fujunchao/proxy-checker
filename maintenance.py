@@ -2,7 +2,6 @@
 import asyncio
 from collections import deque
 from contextlib import asynccontextmanager
-import inspect
 import threading
 import time
 from repository import endpoint
@@ -68,7 +67,7 @@ async def check_batches(engine, budget, workspace, proxies, stop_event, rounds,
 class IncrementalBatch:
     def __init__(self, store, engine, budget, workspace, config, context, stop,
                  observation, on_result=lambda r: None, on_status=lambda **s: None,
-                 clock=time.time, wait=asyncio.sleep):
+                 clock=time.monotonic, wait=asyncio.sleep):
         self.store, self.engine, self.budget, self.workspace = store, engine, budget, workspace
         self.config, self.context, self.stop, self.observation = config, context, stop, observation
         self.on_result, self.on_status, self.clock, self.wait = on_result, on_status, clock, wait
@@ -79,9 +78,20 @@ class IncrementalBatch:
         budget_stop = threading.Event()
         combined = CombinedStop(self.stop, budget_stop)
         completed, accepted_inputs = 0, []
+        delivering = {}
         totals = {"repo_added": 0, "repo_updated": 0, "repo_removed": 0, "conflict_skipped": 0}
         ready = asyncio.Event()
         done = asyncio.Event()
+
+        async def commit(batch):
+            if self.stop.is_set():
+                return
+            result = await asyncio.to_thread(self.store.publish, self.context, batch, cfg["repo_update_policy"])
+            for key in totals:
+                totals[key] += result[key]
+            self.on_status(**totals, repo_count=result["repo_count"],
+                           repo_revision=result["repo_revision"], last_published_at=result["last_published_at"],
+                           pending_count=queue.qsize())
 
         async def receive(result):
             nonlocal completed
@@ -91,7 +101,9 @@ class IncrementalBatch:
             completed += 1
             accepted_inputs.append(result.get("original") or result.get("proxy"))
             self.on_result(result)
+            delivering[obs["observation_id"]] = obs
             await queue.put(obs)  # 背压，检测器必须等待回调，不丢完整观测。
+            delivering.pop(obs["observation_id"], None)
             ready.set()
             self.on_status(pending_count=queue.qsize())
 
@@ -116,12 +128,7 @@ class IncrementalBatch:
                 batch = []
                 while not queue.empty() and len(batch) < cfg["publish_count"]:
                     batch.append(queue.get_nowait())
-                result = await asyncio.to_thread(self.store.publish, self.context, batch, cfg["repo_update_policy"])
-                for key in totals:
-                    totals[key] += result[key]
-                self.on_status(**totals, repo_count=result["repo_count"],
-                               repo_revision=result["repo_revision"], last_published_at=result["last_published_at"],
-                               pending_count=queue.qsize())
+                await commit(batch)
 
         async def detect(slots):
             try:
@@ -149,9 +156,15 @@ class IncrementalBatch:
                 await asyncio.gather(detection, return_exceptions=True)
                 if not detection.cancelled() and detection.exception():
                     raise detection.exception()
+                # 预算中断可能发生在工作者等待缓冲空间时；完整观测不能丢失。
+                # delivering 至多等于网络工作者数，人工取消则明确丢弃未提交结果。
                 done.set()
                 ready.set()
                 await publisher
+                remainder = list(delivering.values())
+                for offset in range(0, len(remainder), cfg["publish_count"]):
+                    await commit(remainder[offset:offset + cfg["publish_count"]])
+                delivering.clear()
             finally:
                 budget_stop.set()
                 detection.cancel()

@@ -413,7 +413,7 @@ class RepoView(list):
         self.epoch = data["epoch"]
 
 
-@functools.lru_cache(maxsize=128)
+@functools.lru_cache(maxsize=16)
 def _repository(directory, token):
     return Repository(directory, token, compact_repo, annotate_shared_ips,
                       result_to_repo_item, result_matches_policy)
@@ -548,6 +548,8 @@ def read_checked_list(token):
 
 def write_checked_list(token, proxies):
     proxies = normalize_proxy_list(proxies)
+    if len(proxies) > 200000:
+        raise RepositoryError("检测历史达到 200000 条容量上限，请导出后显式清理")
     with checked_lock:
         atomic_write_text(checked_txt_path(token), "\n".join(proxies))
     return proxies
@@ -585,7 +587,8 @@ def compact_run_log(entry):
         "schedule_type", "interval_hours", "daily_time", "timezone", "source_count",
         "repo_input_count", "repo_count", "input_count", "skipped", "total", "done",
         "valid_count", "unstable_count", "invalid_count", "repo_added", "repo_updated",
-        "repo_removed", "error",
+        "repo_removed", "error", "work_type", "incomplete_count", "conflict_skipped",
+        "repo_revision", "last_published_at", "due_count", "discovery_pending",
     ):
         value = entry.get(key)
         if value is not None and value != "":
@@ -924,6 +927,8 @@ def save_runtime_settings(settings):
     if password_changed:
         local_config["auth_password"] = AUTH_PASSWORD
     write_local_config(local_config)
+    for token in list(auto_runtime):
+        stop_auto_run(token)
     return password_changed
 
 # ============================================================
@@ -1110,6 +1115,7 @@ def get_auto_status(token, since=0, client_session_id="", summary_only=False):
         record["results_index"] = results_index
         record["results_session_id"] = source.get("run_id") if source else None
         record["results_total"] = len(source.get("results", [])) if source else 0
+        state.update(repo_store(token).summary())
         return record
 
 
@@ -1279,6 +1285,7 @@ def build_auto_summary(runtime, status, error=None, repo_summary=None):
         "unstable_count": unstable,
         "invalid_count": invalid,
     }
+    summary.update({k: runtime[k] for k in MAINTENANCE_STATUS_FIELDS if k in runtime})
     if error:
         summary["error"] = str(error)[:300]
     if repo_summary:
@@ -1305,13 +1312,13 @@ def finalize_auto_run(token, runtime, status, error=None, repo_summary=None):
             **{k: runtime[k] for k in MAINTENANCE_STATUS_FIELDS if k in runtime},
         })
         if config["maintenance_mode"] == "continuous":
-            if status == "stopped":
+            if status == "stopped" and state.get("config_generation", 0) == runtime.get("config_generation", 0):
                 state["maintenance_paused"] = True
                 state["next_run_at"] = None
             elif status == "failed":
                 state["next_run_at"] = None
                 state["maintenance_paused"] = True
-            elif runtime.get("next_delay"):
+            elif runtime.get("next_delay") and config.get("enabled"):
                 state["next_run_at"] = int(time.time() + runtime["next_delay"])
         append_auto_history(state, summary)
         save_auto_record(token, {"config": config, "state": state})
@@ -1321,6 +1328,9 @@ def finalize_auto_run(token, runtime, status, error=None, repo_summary=None):
             "results": list(runtime.get("results", [])),
             "expires": time.time() + 900,
         }
+        while len(auto_stopped_results) > 64:
+            oldest = min(list(auto_stopped_results), key=lambda k: auto_stopped_results.get(k, {}).get("expires", 0))
+            auto_stopped_results.pop(oldest, None)
         stored = auto_runtime.get(token)
         if stored and stored.get("run_id") == runtime.get("run_id"):
             stored["finished"] = True
@@ -1337,7 +1347,8 @@ def finalize_auto_run(token, runtime, status, error=None, repo_summary=None):
              summary["done"], summary["total"])
 
 
-def execute_maintenance_run(token, config, runtime, *, engine=None, source=None, clock=time.time):
+def execute_maintenance_run(token, config, runtime, *, engine=None, source=None, clock=time.time,
+                            timer_clock=time.monotonic):
     """每次只协调一个有限批次；后台调度器接续，不依赖网页轮询。"""
     store = repo_store(token)
     engine = engine or check_engine
@@ -1346,6 +1357,12 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
     profile = config["target_profile"]
     if state.get("profile") != profile:
         state = {"profile": profile}
+    # 上次进程终止时仅恢复候选，废弃旧观测；已提交项会被存量键过滤，不重放成功。
+    if state.get("inflight_type") == "discover":
+        rest = state.get("candidates", [])[state.get("cursor", 0):]
+        state.update(candidates=normalize_proxy_list(rest + state.get("inflight_inputs", [])), cursor=0)
+    state.pop("inflight_type", None)
+    state.pop("inflight_inputs", None)
     work_type, proxies, info = choose_batch(store.snapshot(), state, config, clock())
     update_auto_runtime(token, work_type=work_type, **info, **store.summary())
     log.info("maintenance batch workspace=%s run=%s type=%s due=%s pending=%s",
@@ -1394,7 +1411,8 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
                                 source_count=len(candidates))
         if runtime["stop"].is_set():
             return {}, []
-        # 先存游标：进程退出后不重放内存成功观测。未完成的发现项回到有界队尾。
+        # 先存游标及在途输入：进程退出后不重放内存成功观测，输入回到有界队尾。
+        state.update(inflight_type=work_type, inflight_inputs=proxies)
         await asyncio.to_thread(store.maintenance, state)
         update_auto_runtime(token, total=len(proxies), input_count=len(proxies), stage="detecting")
         if not proxies:
@@ -1405,7 +1423,7 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
         try:
             batch = IncrementalBatch(store, engine, network_budget, token, config, context, runtime["stop"],
                                      make_observation, lambda r: publish_auto_result(token, r),
-                                     lambda **s: update_auto_runtime(token, **s), clock=clock)
+                                     lambda **s: update_auto_runtime(token, **s), clock=timer_clock)
             summary, completed = await batch.run(proxies)
             if work_type == "discover":
                 complete_keys = set(map(proxy_key, completed))
@@ -1414,6 +1432,8 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
                 rest = state.get("candidates", [])[state.get("cursor", 0):]
                 state.update(candidates=rest + unfinished, cursor=0)
             if not runtime["stop"].is_set():
+                state.pop("inflight_type", None)
+                state.pop("inflight_inputs", None)
                 await asyncio.to_thread(store.maintenance, state)
                 # 批次末重新统计真实到期情况，轮询只计算年龄，不扫描大结果集。
                 _, _, after = choose_batch(store.snapshot(), dict(state), config, clock())
@@ -1634,6 +1654,12 @@ def stop_auto_run(token):
     with auto_workspace_lock(token):
         runtime = auto_runtime.get(token)
         if not runtime:
+            record = load_auto_record(token)
+            if record["config"]["maintenance_mode"] == "continuous":
+                record["state"].update(maintenance_paused=True, next_run_at=None, status="stopped", stage="stopped")
+                repo_store(token).fence()
+                save_auto_record(token, record)
+                return True
             return False
         runtime["status"] = "stopping"
         runtime["stage"] = "stopping"
@@ -1674,7 +1700,11 @@ def mark_interrupted_auto_runs():
     now = int(time.time())
     for token in list_auto_tokens():
         with auto_workspace_lock(token):
-            record = load_auto_record(token)
+            try:
+                record = load_auto_record(token)
+            except RepositoryError:
+                log.error("maintenance state unreadable workspace=%s", hashlib.sha256(token.encode()).hexdigest()[:10])
+                continue
             config = normalize_auto_config(record.get("config", {}))
             state = record["state"]
             if not state.get("running"):
@@ -1705,34 +1735,35 @@ def mark_interrupted_auto_runs():
             save_auto_record(token, {"config": config, "state": state})
 
 
-def scheduler_loop():
-    while True:
-        due_tokens = []
-        now = time.time()
-        for token in list_auto_tokens():
+def scheduler_tick(now=None):
+    now = time.time() if now is None else now
+    due = []
+    for token in list_auto_tokens():
+        try:
             with auto_workspace_lock(token):
                 record = load_auto_record(token)
-                config = normalize_auto_config(record.get("config", {}))
-                state = record["state"]
-                if not config.get("enabled") or token in auto_runtime or state.get("maintenance_paused"):
+                config, state = record["config"], record["state"]
+                if not config["enabled"] or token in auto_runtime or state.get("maintenance_paused"):
                     continue
-                next_run_at = state.get("next_run_at")
-                if next_run_at is None:
-                    state["next_run_at"] = compute_next_run(config, now)
-                    save_auto_record(token, {"config": config, "state": state})
-                    continue
-                try:
-                    due = float(next_run_at) <= now
-                except (TypeError, ValueError):
-                    due = True
-                if due:
-                    due_tokens.append(token)
-        for token in due_tokens:
-            started, message = start_auto_run(token, "schedule")
-            if started:
-                log.info("Scheduled auto run started", extra={"token": token})
-            else:
-                log.warning("Scheduled auto run skipped", extra={"token": token, "message": message})
+                when = state.get("next_run_at")
+                if when is not None and float(when) <= now:
+                    due.append((state.get("last_run_at") or 0, token))
+        except (RepositoryError, ValueError, TypeError):
+            # 坏工作区不拖垮其他工作区；管理状态返回显式错误，不覆盖损坏文件。
+            continue
+    for _, token in sorted(due):
+        try:
+            start_auto_run(token, "schedule")
+        except RepositoryError:
+            continue
+    for token, retained in list(auto_stopped_results.items()):
+        if retained.get("expires", 0) < now:
+            auto_stopped_results.pop(token, None)
+
+
+def scheduler_loop():
+    while True:
+        scheduler_tick()
         time.sleep(1)
 
 
@@ -1896,6 +1927,11 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 from http.server import SimpleHTTPRequestHandler
 
 class Handler(SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # 默认 handler 会把订阅 token / 查询参数写入访问日志；只记录方法和状态码。
+        code = args[1] if len(args) > 1 and str(args[1]).isdigit() else "-"
+        log.info("http method=%s status=%s", self.command, code)
+
     def do_GET(self):
         path = self.path.split("?")[0]
 
@@ -2052,6 +2088,9 @@ class Handler(SimpleHTTPRequestHandler):
 
             elif self.path == "/api/start":
                 proxies = body.get("proxies", [])
+                if not isinstance(proxies, list) or len(proxies) > 50000 or len(sessions) >= 32:
+                    self._json(429, {"error": "每次最多 50000 条，最多保留 32 个手动任务，请稍后重试"})
+                    return
                 rounds = normalize_rounds(body.get("rounds", CHECK_ROUNDS))
                 target_profile = normalize_target_profile(body.get("target_profile", "generic"))
                 max_concurrent = normalize_max_concurrent(body.get("max_concurrent", MAX_CONCURRENT))
@@ -2227,7 +2266,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not token.replace("_","").isalnum():
                     token = "default"
                 proxies = write_checked_list(token, proxies)
-                log.info(f"Checked proxies saved: token={token}, count={len(proxies)}")
+                log.info("checked saved workspace=%s count=%s", hashlib.sha256(token.encode()).hexdigest()[:10], len(proxies))
                 self._json(200, {"ok": True, "count": len(proxies)})
 
             elif self.path == "/api/checked/filter":
@@ -2257,9 +2296,10 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_response(404); self.end_headers()
 
         except Exception as e:
-            log.error(f"POST error: {e}")
+            log.error("http failed error_type=%s", type(e).__name__)
             try:
-                self._json(500, {"error": str(e)})
+                self._json(503 if isinstance(e, RepositoryError) else 500,
+                           {"error": str(e) if isinstance(e, RepositoryError) else "请求处理失败，请重试"})
             except:
                 pass
 
