@@ -7,6 +7,11 @@ import asyncio
 import logging
 import hashlib
 import hmac
+import functools
+import uuid
+from repository import Repository, RepositoryError, endpoint
+from maintenance import FairBudget, IncrementalBatch, check_batches, choose_batch
+from fetch_proxies import fetch_maintenance_source
 from datetime import datetime, timedelta, timezone
 from http import cookies
 from http.server import HTTPServer
@@ -169,6 +174,15 @@ sessions_lock = threading.Lock()
 auto_runtime = {}
 auto_stopped_results = {}
 auto_lock = threading.Lock()
+AUTO_LOCKS = [threading.RLock() for _ in range(64)]
+
+def auto_workspace_lock(token):
+    return AUTO_LOCKS[int(hashlib.sha256(str(token).encode()).hexdigest()[:8], 16) % len(AUTO_LOCKS)]
+
+# 上限只在进程启动时读取；修改全局检测并发不会偷偷扩大进程预算。
+PROCESS_NETWORK_LIMIT = max(1, min(1000, get_config_int("process_network_limit", "PROCESS_NETWORK_LIMIT", MAX_CONCURRENT_LIMIT)))
+network_budget = FairBudget(PROCESS_NETWORK_LIMIT)
+
 checked_lock = threading.RLock()
 AUTO_RESULT_PAGE_SIZE = 1000
 TARGET_PROFILE_IDS = {str(item["id"]) for item in TARGET_PROFILE_OPTIONS}
@@ -306,7 +320,7 @@ def read_json_file(path, fallback):
 
 
 def proxy_key(value):
-    return str(value or "").strip().lower()
+    return endpoint(value)
 
 
 def normalize_proxy_list(items):
@@ -356,7 +370,7 @@ def compact_repo_item(item):
     now = int(time.time() * 1000)
     compact = {"proxy": proxy, "grade": str(item.get("grade") or "?")}
     for key in ("latency", "ip", "country", "ip_type", "recommended_use", "target_profile", "target_name",
-                "usable", "usable_reason", "protocol_note", "last_ok"):
+                "usable", "usable_reason", "protocol_note", "last_ok", "last_checked_at"):
         value = item.get(key)
         if value is not None and value != "":
             compact[key] = value
@@ -391,18 +405,26 @@ def compact_repo(repo):
     return out
 
 
+class RepoView(list):
+    """兼容列表调用者，同时携带读取版本，禁止旧列表重新整仓写回。"""
+    def __init__(self, data):
+        super().__init__(compact_repo(data["items"]))
+        self.revision = data["revision"]
+        self.epoch = data["epoch"]
+
+
+@functools.lru_cache(maxsize=128)
+def _repository(directory, token):
+    return Repository(directory, token, compact_repo, annotate_shared_ips,
+                      result_to_repo_item, result_matches_policy)
+
+
+def repo_store(token):
+    return _repository(REPO_DIR, sanitize_token(token))
+
+
 def read_repo_data(token):
-    token = sanitize_token(token)
-    json_file = repo_json_path(token)
-    if os.path.isfile(json_file):
-        data = read_json_file(json_file, [])
-        if isinstance(data, list):
-            return compact_repo(data)
-    txt_file = repo_txt_path(token)
-    if not os.path.isfile(txt_file):
-        return []
-    with open(txt_file, "r", encoding="utf-8") as f:
-        return compact_repo({"proxy": line.strip()} for line in f if line.strip())
+    return RepoView(repo_store(token).snapshot())
 
 
 def annotate_shared_ips(repo):
@@ -426,11 +448,10 @@ def annotate_shared_ips(repo):
 
 
 def write_repo_data(token, repo):
-    token = sanitize_token(token)
-    repo = annotate_shared_ips(compact_repo(repo))
-    atomic_write_json(repo_json_path(token), repo)
-    atomic_write_text(repo_txt_path(token), "\n".join(item["proxy"] for item in repo))
-    return repo
+    store = repo_store(token)
+    with store.lock:
+        saved, response = store.save(repo, "replace", store.summary()["repo_revision"])
+        return saved
 
 
 def merge_repo_data(existing, incoming):
@@ -451,50 +472,13 @@ def merge_repo_data(existing, incoming):
     return compact_repo(merged)
 
 
-def save_repo_payload(token, incoming, mode="merge", base_count=None):
-    token = sanitize_token(token)
-    mode = mode if mode in ("merge", "replace") else "merge"
-    incoming_repo = compact_repo(incoming)
-    existing_repo = read_repo_data(token)
-    current_count = len(existing_repo)
-    try:
-        expected_count = int(base_count)
-    except (TypeError, ValueError):
-        expected_count = None
-
-    if mode == "replace":
-        if expected_count is None and current_count > len(incoming_repo):
-            return None, {
-                "ok": False,
-                "stale_repo": True,
-                "current_count": current_count,
-                "submitted_count": len(incoming_repo),
-                "error": "云端仓库已有更多代理，请先刷新云端仓库后再删除或覆盖",
-            }
-        if expected_count is not None and expected_count != current_count:
-            return None, {
-                "ok": False,
-                "stale_repo": True,
-                "current_count": current_count,
-                "submitted_count": len(incoming_repo),
-                "base_count": expected_count,
-                "error": "云端仓库已被更新，请先刷新云端仓库后再删除或覆盖",
-            }
-        saved = write_repo_data(token, incoming_repo)
-    else:
-        saved = write_repo_data(token, merge_repo_data(existing_repo, incoming_repo))
-
-    return saved, {
-        "ok": True,
-        "mode": mode,
-        "count": len(saved),
-        "current_count": current_count,
-        "submitted_count": len(incoming_repo),
-    }
+def save_repo_payload(token, incoming, mode="merge", base_count=None, base_revision=None):
+    return repo_store(token).save(incoming, mode if mode in ("merge", "replace") else "merge",
+                                 base_revision, base_count)
 
 
 def truthy_param(value):
-    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+    return endpoint(value) in ("1", "true", "yes", "on")
 
 
 def proto_of(proxy):
@@ -682,6 +666,14 @@ def run_logs_payload(token):
 def default_auto_config():
     return {
         "enabled": False,
+        "maintenance_mode": "legacy",
+        "refresh_seconds": 900,
+        "refresh_batch": 100,
+        "discover_batch": 200,
+        "batch_seconds": 120,
+        "publish_count": 20,
+        "publish_seconds": 10,
+        "refresh_share": 4,
         "schedule_type": "interval",
         "interval_hours": 6,
         "daily_time": "03:00",
@@ -739,6 +731,11 @@ def normalize_auto_config(config):
         repo_update_policy = "stable_only"
     return {
         "enabled": bool(merged.get("enabled")),
+        "maintenance_mode": "continuous" if merged.get("maintenance_mode") == "continuous" else "legacy",
+        **{k: max(lo, min(hi, get_int_from(merged, k, defaults[k]))) for k, lo, hi in (
+            ("refresh_seconds", 30, 86400), ("refresh_batch", 1, 100), ("discover_batch", 1, 200),
+            ("batch_seconds", 1, 120), ("publish_count", 1, 200), ("publish_seconds", 1, 60),
+            ("refresh_share", 1, 20))},
         "schedule_type": schedule_type,
         "interval_hours": interval_hours,
         "daily_time": normalize_daily_time(merged.get("daily_time")),
@@ -756,6 +753,8 @@ def compute_next_run(config, now=None):
     if not config.get("enabled"):
         return None
     now = time.time() if now is None else float(now)
+    if config["maintenance_mode"] == "continuous":
+        return int(now + 2)
     if config["schedule_type"] == "daily":
         hour, minute = [int(part) for part in config["daily_time"].split(":", 1)]
         tz = get_timezone(config.get("timezone"))
@@ -962,7 +961,16 @@ def list_auto_tokens():
 
 def load_auto_record(token):
     token = sanitize_token(token)
-    data = read_json_file(auto_json_path(token), {})
+    path = auto_json_path(token)
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or not isinstance(data.get("config"), dict) or not isinstance(data.get("state"), dict):
+                raise ValueError("schema")
+        except (OSError, ValueError) as exc:
+            raise RepositoryError("维护状态不可读，已暂停自动写入") from exc
     config = normalize_auto_config(data.get("config") if isinstance(data, dict) else {})
     state = default_auto_state(config)
     if isinstance(data, dict) and isinstance(data.get("state"), dict):
@@ -1013,7 +1021,7 @@ def retained_auto_results(token):
 
 def get_auto_result_page(token, session_id, since=0, limit=AUTO_RESULT_PAGE_SIZE):
     token = sanitize_token(token)
-    with auto_lock:
+    with auto_workspace_lock(token):
         source = retained_auto_results(token)
         if not source:
             return 410, {"error": "本轮结果已过期，请刷新任务状态", "expired": True}
@@ -1033,7 +1041,7 @@ def get_auto_result_page(token, session_id, since=0, limit=AUTO_RESULT_PAGE_SIZE
 
 def get_auto_status(token, since=0, client_session_id="", summary_only=False):
     token = sanitize_token(token)
-    with auto_lock:
+    with auto_workspace_lock(token):
         record = load_auto_record(token)
         config = normalize_auto_config(record.get("config", {}))
         runtime = auto_runtime.get(token)
@@ -1088,6 +1096,10 @@ def get_auto_status(token, since=0, client_session_id="", summary_only=False):
                 new_results = [] if summary_only else results[since:]
                 results_index = len(results)
         state = record["state"]
+        if runtime:
+            state.update({k: runtime[k] for k in MAINTENANCE_STATUS_FIELDS if k in runtime})
+        oldest = state.get("oldest_checked_at")
+        state["oldest_refresh_age_seconds"] = max(0, int(time.time() - oldest)) if oldest is not None else None
         state["next_run_text"] = format_timestamp(state.get("next_run_at"), config.get("timezone"))
         state["started_text"] = format_timestamp(state.get("started_at"), config.get("timezone"))
         state["finished_text"] = format_timestamp(state.get("finished_at"), config.get("timezone"))
@@ -1103,27 +1115,28 @@ def get_auto_status(token, since=0, client_session_id="", summary_only=False):
 
 def is_auto_running(token):
     token = sanitize_token(token)
-    with auto_lock:
+    with auto_workspace_lock(token):
         runtime = auto_runtime.get(token)
         return bool(runtime and not runtime.get("finished"))
 
 
+MAINTENANCE_STATUS_FIELDS = ("work_type", "due_count", "unknown_age_count", "oldest_checked_at",
+    "migration_required", "other_profile_count", "discovery_pending", "pending_count", "incomplete_count",
+    "last_published_at", "repo_revision", "repo_added", "repo_updated", "repo_removed", "conflict_skipped",
+    "last_progress_at", "source_error")
+
+
 def update_auto_runtime(token, **fields):
-    token = sanitize_token(token)
-    with auto_lock:
+    with auto_workspace_lock(token):
         runtime = auto_runtime.get(token)
         if runtime:
+            previous_revision = runtime.get("repo_revision")
             runtime.update(fields)
-        record = load_auto_record(token)
-        state = record["state"]
-        if "stage" in fields:
-            state["stage"] = fields["stage"]
-        if "status" in fields:
-            state["status"] = fields["status"]
-        for key in ("total", "done", "source_count", "repo_count", "input_count", "skipped", "error"):
-            if key in fields:
-                state[key] = fields[key]
-        save_auto_record(token, record)
+            if fields.get("repo_revision") is not None and fields["repo_revision"] != previous_revision:
+                log.info("maintenance publish workspace=%s run=%s revision=%s added=%s updated=%s removed=%s conflicts=%s",
+                         hashlib.sha256(token.encode()).hexdigest()[:10], runtime["run_id"], fields["repo_revision"],
+                         fields.get("repo_added", 0), fields.get("repo_updated", 0), fields.get("repo_removed", 0),
+                         fields.get("conflict_skipped", 0))
 
 
 def result_repo_key(result):
@@ -1131,7 +1144,7 @@ def result_repo_key(result):
 
 
 def result_to_repo_item(result, existing=None):
-    now = int(time.time() * 1000)
+    now = int(result.get("completed_at") or time.time() * 1000)
     existing = existing or {}
     country = result.get("country")
     checks_detail = result.get("checks_detail")
@@ -1209,71 +1222,35 @@ def result_matches_policy(result, policy):
 
 
 def merge_repo_results(token, repo, results, checked_inputs, policy):
-    policy = policy if policy in REPO_UPDATE_POLICIES else "stable_only"
-    participating = {proxy_key(proxy) for proxy in checked_inputs}
-    result_by_key = {}
-    for result in results:
-        for value in (result.get("original"), result.get("proxy")):
-            key = proxy_key(value)
-            if key:
-                result_by_key[key] = result
+    """旧内部入口：没有读取版本的裸列表不能作为覆盖依据。"""
+    store = repo_store(token)
+    with store.lock:
+        current = store.snapshot()
+        if (getattr(repo, "revision", None) != current["revision"]
+                or getattr(repo, "epoch", None) != current["epoch"]):
+            return {**store.summary(), "repo_added": 0, "repo_updated": 0,
+                    "repo_removed": 0, "conflict_skipped": len(results)}
+        profile = results[0].get("target_profile", "generic") if results else "generic"
+        context = store.begin(uuid.uuid4().hex, profile, 0, checked_inputs)
+        try:
+            observations = [make_observation(context, result, i) for i, result in enumerate(results)]
+            return store.publish(context, observations, policy)
+        finally:
+            store.finish(context["run_id"])
 
-    existing_by_key = {}
-    for item in compact_repo(repo):
-        existing_by_key[proxy_key(item["proxy"])] = item
 
-    removed = 0
-    next_repo = []
-    used_old_keys = set()
-    for item in compact_repo(repo):
-        key = proxy_key(item["proxy"])
-        result = result_by_key.get(key)
-        if policy != "archive_all" and key in participating and result and not result_matches_policy(result, policy):
-            removed += 1
-            used_old_keys.add(key)
-            continue
-        next_repo.append(item)
-
-    index_by_key = {proxy_key(item["proxy"]): i for i, item in enumerate(next_repo)}
-    added = 0
-    updated = 0
-    for result in results:
-        if not result_matches_policy(result, policy):
-            continue
-        candidate_keys = [proxy_key(result.get("original")), proxy_key(result.get("proxy"))]
-        existing = None
-        existing_index = None
-        for key in candidate_keys:
-            if key in index_by_key:
-                existing_index = index_by_key[key]
-                existing = next_repo[existing_index]
-                break
-            if key in existing_by_key:
-                existing = existing_by_key[key]
-        item = result_to_repo_item(result, existing)
-        if not item:
-            continue
-        if existing_index is None:
-            next_repo.append(item)
-            index_by_key[proxy_key(item["proxy"])] = len(next_repo) - 1
-            added += 1
-        else:
-            next_repo[existing_index] = item
-            index_by_key[proxy_key(item["proxy"])] = existing_index
-            updated += 1
-
-    saved = write_repo_data(token, next_repo)
-    return {
-        "repo_count": len(saved),
-        "repo_added": added,
-        "repo_updated": updated,
-        "repo_removed": removed,
-    }
+def make_observation(context, result, index):
+    detail = result_summary(result)
+    complete = result.get("terminal_complete") is True
+    return {"observation_id": str(index), "run_id": context["run_id"],
+            "started_at": result.get("started_at", context["started_at"]),
+            "completed_at": result.get("completed_at", int(time.time() * 1000)),
+            "complete": complete, "result": result}
 
 
 def build_auto_summary(runtime, status, error=None, repo_summary=None):
     results = runtime.get("results", [])
-    valid, unstable, invalid = runtime_counts(results)
+    valid, unstable, invalid = runtime.get("counts", runtime_counts(results))
     started_at = runtime.get("started_at") or time.time()
     finished_at = time.time()
     summary = {
@@ -1312,7 +1289,7 @@ def build_auto_summary(runtime, status, error=None, repo_summary=None):
 def finalize_auto_run(token, runtime, status, error=None, repo_summary=None):
     token = sanitize_token(token)
     summary = build_auto_summary(runtime, status, error, repo_summary)
-    with auto_lock:
+    with auto_workspace_lock(token):
         record = load_auto_record(token)
         config = normalize_auto_config(record.get("config", {}))
         state = record["state"]
@@ -1325,7 +1302,17 @@ def finalize_auto_run(token, runtime, status, error=None, repo_summary=None):
             "last_run_at": summary["finished_at"],
             "next_run_at": compute_next_run(config) if config.get("enabled") else None,
             "error": summary.get("error"),
+            **{k: runtime[k] for k in MAINTENANCE_STATUS_FIELDS if k in runtime},
         })
+        if config["maintenance_mode"] == "continuous":
+            if status == "stopped":
+                state["maintenance_paused"] = True
+                state["next_run_at"] = None
+            elif status == "failed":
+                state["next_run_at"] = None
+                state["maintenance_paused"] = True
+            elif runtime.get("next_delay"):
+                state["next_run_at"] = int(time.time() + runtime["next_delay"])
         append_auto_history(state, summary)
         save_auto_record(token, {"config": config, "state": state})
         # 完成或失败也保留尾页，避免摘要先显示终态后客户端丢掉尚未恢复的结果。
@@ -1345,19 +1332,121 @@ def finalize_auto_run(token, runtime, status, error=None, repo_summary=None):
         "session_id": runtime.get("run_id"),
         "target_name": get_target_profile_name(summary.get("target_profile")),
     })
-    log.info("Auto run finished", extra={"token": token, "status": status, "summary": summary})
+    log.info("maintenance end workspace=%s run=%s status=%s done=%s total=%s",
+             hashlib.sha256(token.encode()).hexdigest()[:10], runtime.get("run_id"), status,
+             summary["done"], summary["total"])
+
+
+def execute_maintenance_run(token, config, runtime, *, engine=None, source=None, clock=time.time):
+    """每次只协调一个有限批次；后台调度器接续，不依赖网页轮询。"""
+    store = repo_store(token)
+    engine = engine or check_engine
+    source = source or fetch_maintenance_source
+    state = store.maintenance()
+    profile = config["target_profile"]
+    if state.get("profile") != profile:
+        state = {"profile": profile}
+    work_type, proxies, info = choose_batch(store.snapshot(), state, config, clock())
+    update_auto_runtime(token, work_type=work_type, **info, **store.summary())
+    log.info("maintenance batch workspace=%s run=%s type=%s due=%s pending=%s",
+             hashlib.sha256(token.encode()).hexdigest()[:10], runtime["run_id"], work_type,
+             info["due_count"], info["discovery_pending"])
+
+    async def run():
+        nonlocal proxies
+        if work_type == "discover":
+            candidates = state.get("candidates", [])
+            cursor = state.get("cursor", 0)
+            if cursor >= len(candidates):
+                update_auto_runtime(token, stage="fetching")
+                index = state.get("source_index", 0)
+                state["source_index"] = index + 1
+                try:
+                    async with network_budget.lease(token, 1, runtime["stop"]) as slots:
+                        if not slots:
+                            return {}, []
+                        fetched, source_id = await asyncio.to_thread(source, index, runtime["stop"])
+                    if len(fetched) > 50000:
+                        raise ValueError("source capacity")
+                    candidates = normalize_proxy_list(fetched)
+                    state.update(candidates=candidates, cursor=0)
+                    cursor = 0
+                except Exception as exc:
+                    # 不复制外部错误正文／URL；来源失败仍推进源游标，下批先检查到期库存。
+                    update_auto_runtime(token, source_error="来源读取失败（" + type(exc).__name__ + "）")
+                    state.update(candidates=[], cursor=0)
+                    runtime["next_delay"] = 10
+                    if not runtime["stop"].is_set():
+                        await asyncio.to_thread(store.maintenance, state)
+                    return {}, []
+            if runtime["stop"].is_set():
+                return {}, []
+            end = min(len(candidates), cursor + config["discover_batch"])
+            proxies = candidates[cursor:end]
+            state["cursor"] = end
+            snapshot = await asyncio.to_thread(store.snapshot)
+            # 存量只由 refresh 管理；缺档位和其他档位不因发现同址而被迁移。
+            existing_keys = {proxy_key(i["proxy"]) for i in snapshot["items"]}
+            checked = set(map(proxy_key, read_checked_list(token))) if config["detect_mode"] == "skip" else set()
+            before = len(proxies)
+            proxies = [p for p in proxies if proxy_key(p) not in checked and proxy_key(p) not in existing_keys]
+            update_auto_runtime(token, skipped=before - len(proxies), discovery_pending=len(candidates) - end,
+                                source_count=len(candidates))
+        if runtime["stop"].is_set():
+            return {}, []
+        # 先存游标：进程退出后不重放内存成功观测。未完成的发现项回到有界队尾。
+        await asyncio.to_thread(store.maintenance, state)
+        update_auto_runtime(token, total=len(proxies), input_count=len(proxies), stage="detecting")
+        if not proxies:
+            runtime["next_delay"] = 5
+            return {}, []
+        context = await asyncio.to_thread(store.begin, runtime["run_id"], profile,
+                                          runtime.get("config_generation", 0), proxies)
+        try:
+            batch = IncrementalBatch(store, engine, network_budget, token, config, context, runtime["stop"],
+                                     make_observation, lambda r: publish_auto_result(token, r),
+                                     lambda **s: update_auto_runtime(token, **s), clock=clock)
+            summary, completed = await batch.run(proxies)
+            if work_type == "discover":
+                complete_keys = set(map(proxy_key, completed))
+                unfinished = [p for p in proxies if proxy_key(p) not in complete_keys]
+                # 消费的前缀回收空间，未完成项轮转；候选数量不会增加。
+                rest = state.get("candidates", [])[state.get("cursor", 0):]
+                state.update(candidates=rest + unfinished, cursor=0)
+            if not runtime["stop"].is_set():
+                await asyncio.to_thread(store.maintenance, state)
+                # 批次末重新统计真实到期情况，轮询只计算年龄，不扫描大结果集。
+                _, _, after = choose_batch(store.snapshot(), dict(state), config, clock())
+                update_auto_runtime(token, **after)
+            return summary, completed
+        finally:
+            await asyncio.to_thread(store.finish, runtime["run_id"])
+
+    summary, completed = asyncio.run(run())
+    if completed and not runtime["stop"].is_set():
+        append_checked_list(token, completed)
+    return {**summary, **store.summary()}
 
 
 def execute_auto_run(token, config, run_id, reason):
     token = sanitize_token(token)
     runtime = None
     try:
-        with auto_lock:
+        with auto_workspace_lock(token):
             runtime = auto_runtime[token]
+        if config["maintenance_mode"] == "continuous":
+            summary = execute_maintenance_run(token, config, runtime)
+            finalize_auto_run(token, runtime, "stopped" if runtime["stop"].is_set() else "completed", repo_summary=summary)
+            return
         update_auto_runtime(token, stage="fetching", status="running")
         if not FETCH_PROXIES_AVAILABLE:
             raise RuntimeError("fetch_proxies 模块不可用")
-        fetched, _source_name, err = fetch_proxies("all", 50000)
+        async def fetch_legacy():
+            async with network_budget.lease(token, 1, runtime["stop"]) as slots:
+                if not slots:
+                    return [], "all", None
+                return await asyncio.to_thread(fetch_proxies, "all", 50000)
+        fetched, _source_name, err = asyncio.run(fetch_legacy())
         if err:
             raise RuntimeError(err)
         source_proxies = normalize_proxy_list(fetched)
@@ -1374,7 +1463,7 @@ def execute_auto_run(token, config, run_id, reason):
         else:
             to_check = combined
         skipped = len(combined) - len(to_check)
-        with auto_lock:
+        with auto_workspace_lock(token):
             runtime.update({
                 "target_profile": config["target_profile"],
                 "rounds": config["rounds"],
@@ -1388,9 +1477,10 @@ def execute_auto_run(token, config, run_id, reason):
             })
         update_auto_runtime(token, stage="detecting", repo_count=len(repo), total=len(to_check), skipped=skipped)
 
+        context = repo_store(token).begin(run_id, config["target_profile"], runtime.get("config_generation", 0), to_check)
         if to_check:
             async def run_async():
-                await check_engine.check_many_async(
+                await check_batches(check_engine, network_budget, token,
                     proxies=to_check,
                     stop_event=runtime["stop"],
                     rounds=config["rounds"],
@@ -1412,13 +1502,9 @@ def execute_auto_run(token, config, run_id, reason):
         update_auto_runtime(token, stage="updating_repo")
         detected = [result.get("original") or result.get("proxy") for result in runtime.get("results", [])]
         append_checked_list(token, detected)
-        repo_summary = merge_repo_results(
-            token=token,
-            repo=repo,
-            results=runtime.get("results", []),
-            checked_inputs=to_check,
-            policy=config["repo_update_policy"],
-        )
+        observations = [make_observation(context, r, i) for i, r in enumerate(runtime.get("results", []))]
+        repo_summary = repo_store(token).publish(context, observations, config["repo_update_policy"])
+        repo_store(token).finish(run_id)
         finalize_auto_run(token, runtime, "completed", repo_summary=repo_summary)
     except Exception as exc:
         if runtime is None:
@@ -1435,15 +1521,21 @@ def execute_auto_run(token, config, run_id, reason):
                 "detect_mode": config.get("detect_mode", "skip"),
                 "repo_update_policy": config.get("repo_update_policy", "stable_only"),
             }
-        log.error("Auto run failed", extra={"token": token, "error": str(exc)}, exc_info=True)
-        finalize_auto_run(token, runtime, "failed", error=exc)
+        log.error("maintenance failed workspace=%s run=%s stage=%s error_type=%s",
+                  hashlib.sha256(token.encode()).hexdigest()[:10], run_id, runtime.get("stage"), type(exc).__name__)
+        finalize_auto_run(token, runtime, "failed", error="维护失败（" + type(exc).__name__ + "），请检查状态和备份")
+    finally:
+        try:
+            repo_store(token).finish(run_id)
+        except RepositoryError:
+            pass
 
 
 def publish_auto_result(token, result):
     if not result:
         return
     token = sanitize_token(token)
-    with auto_lock:
+    with auto_workspace_lock(token):
         runtime = auto_runtime.get(token)
         if not runtime:
             return
@@ -1458,14 +1550,17 @@ def publish_auto_result(token, result):
 
 def start_auto_run(token, reason="schedule"):
     token = sanitize_token(token)
-    with auto_lock:
+    with auto_workspace_lock(token):
         if token in auto_runtime:
             return False, "自动任务正在执行"
+        if len(auto_runtime) >= 16:
+            return False, "进程维护工作区上限为 16，等待下一次调度"
+        repo_store(token).summary()  # 损坏仓库不能启动自动写入。
         record = load_auto_record(token)
         config = normalize_auto_config(record.get("config", {}))
         if reason == "schedule" and not config.get("enabled"):
             return False, "自动任务未启用"
-        run_id = f"auto_{int(time.time())}_{id(config)}"
+        run_id = "auto_" + uuid.uuid4().hex
         started_at = time.time()
         log_id = start_run_log(token, {
             "id": run_id,
@@ -1488,6 +1583,7 @@ def start_auto_run(token, reason="schedule"):
         runtime = {
             "run_id": run_id,
             "log_id": log_id,
+            "config_generation": record["state"].get("config_generation", 0),
             "reason": reason,
             "stop": threading.Event(),
             "status": "running",
@@ -1512,6 +1608,7 @@ def start_auto_run(token, reason="schedule"):
         auto_runtime[token] = runtime
         auto_stopped_results.pop(token, None)
         state = record["state"]
+        state["maintenance_paused"] = False
         state.update({
             "running": True,
             "status": "running",
@@ -1525,7 +1622,7 @@ def start_auto_run(token, reason="schedule"):
         save_auto_record(token, {"config": config, "state": state})
 
     thread = threading.Thread(target=execute_auto_run, args=(token, config, run_id, reason), daemon=True)
-    with auto_lock:
+    with auto_workspace_lock(token):
         if token in auto_runtime:
             auto_runtime[token]["thread"] = thread
     thread.start()
@@ -1534,13 +1631,14 @@ def start_auto_run(token, reason="schedule"):
 
 def stop_auto_run(token):
     token = sanitize_token(token)
-    with auto_lock:
+    with auto_workspace_lock(token):
         runtime = auto_runtime.get(token)
         if not runtime:
             return False
         runtime["status"] = "stopping"
         runtime["stage"] = "stopping"
         runtime["stop"].set()
+        repo_store(token).fence()
         record = load_auto_record(token)
         record["state"]["status"] = "stopping"
         record["state"]["stage"] = "stopping"
@@ -1550,10 +1648,16 @@ def stop_auto_run(token):
 
 def save_auto_config(token, config):
     token = sanitize_token(token)
-    with auto_lock:
+    with auto_workspace_lock(token):
         record = load_auto_record(token)
         normalized = normalize_auto_config(config)
         state = record["state"]
+        state["config_generation"] = state.get("config_generation", 0) + 1
+        state["maintenance_paused"] = False
+        runtime = auto_runtime.get(token)
+        if runtime:
+            runtime["stop"].set()
+        repo_store(token).fence()
         if normalized.get("enabled"):
             state["status"] = "running" if token in auto_runtime else "idle"
             if token not in auto_runtime:
@@ -1569,7 +1673,7 @@ def save_auto_config(token, config):
 def mark_interrupted_auto_runs():
     now = int(time.time())
     for token in list_auto_tokens():
-        with auto_lock:
+        with auto_workspace_lock(token):
             record = load_auto_record(token)
             config = normalize_auto_config(record.get("config", {}))
             state = record["state"]
@@ -1606,11 +1710,11 @@ def scheduler_loop():
         due_tokens = []
         now = time.time()
         for token in list_auto_tokens():
-            with auto_lock:
+            with auto_workspace_lock(token):
                 record = load_auto_record(token)
                 config = normalize_auto_config(record.get("config", {}))
                 state = record["state"]
-                if not config.get("enabled") or token in auto_runtime:
+                if not config.get("enabled") or token in auto_runtime or state.get("maintenance_paused"):
                     continue
                 next_run_at = state.get("next_run_at")
                 if next_run_at is None:
@@ -1629,7 +1733,7 @@ def scheduler_loop():
                 log.info("Scheduled auto run started", extra={"token": token})
             else:
                 log.warning("Scheduled auto run skipped", extra={"token": token, "message": message})
-        time.sleep(30)
+        time.sleep(1)
 
 
 def start_auto_scheduler():
@@ -1738,7 +1842,7 @@ def run_check(session_id, proxies, rounds=None, target_profile=None, max_concurr
                     s["done"] += 1
 
     async def run_async():
-        await check_engine.check_many_async(
+        await check_batches(check_engine, network_budget, token,
             proxies=proxies,
             stop_event=stop_event,
             rounds=rounds,
@@ -1795,54 +1899,35 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
 
-        # Serve repo as txt: /api/repo/<token>.txt
-        # Serve repo as JSON: /api/repo/<token>.json
-        if path.startswith("/api/repo/") and path.endswith(".json"):
-            token = path.split("/")[-1].replace(".json", "")
-            params = parse_qs(urlparse(self.path).query)
-            json_file = os.path.join(REPO_DIR, f"{token}.json")
-            payload = b"[]"
-            if os.path.isfile(json_file):
-                with open(json_file, "r", encoding="utf-8") as f:
-                    content = f.read()
-                if repo_export_filtered(params):
-                    data = read_json_file(json_file, [])
-                    content = json.dumps(
-                        filter_repo_for_export(data if isinstance(data, list) else [], params),
-                        ensure_ascii=False,
-                    )
-                payload = content.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(payload)
-            return
-
-        # Serve repo as txt: /api/repo/<token>.txt
-        # 带过滤参数时改为读仓库 JSON 动态渲染；不带参数仍直接吐文件，保证老订阅链接逐字不变。
-        if path.startswith("/api/repo/") and path.endswith(".txt"):
-            token = path.split("/")[-1].replace(".txt", "")
-            params = parse_qs(urlparse(self.path).query)
-            repo_file = os.path.join(REPO_DIR, f"{token}.txt")
-            if not os.path.isfile(repo_file):
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(b"Repository not found")
+        # 每份响应固定在同一个完整提交，未升级目录仍保留原始无参数正文。
+        if path.startswith("/api/repo/") and path.endswith((".json", ".txt")):
+            filename = path.rsplit("/", 1)[-1]
+            token, ext = filename.rsplit(".", 1)
+            if token != sanitize_token(token):
+                self._json(400, {"error": "无效身份"})
                 return
-            if repo_export_filtered(params):
-                content = render_repo_txt(
-                    filter_repo_for_export(read_repo_data(token), params),
-                    comment=truthy_param((params.get("comment") or [""])[0]),
-                )
-            else:
-                with open(repo_file, "r", encoding="utf-8") as f:
-                    content = f.read()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(content.encode("utf-8"))
+            try:
+                snapshot = repo_store(token).snapshot()
+                params = parse_qs(urlparse(self.path).query)
+                content = snapshot[ext]
+                if ext == "txt" and content is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if repo_export_filtered(params):
+                    items = filter_repo_for_export(compact_repo(snapshot["items"]), params)
+                    content = (json.dumps(items, ensure_ascii=False) if ext == "json" else
+                               render_repo_txt(items, comment=truthy_param((params.get("comment") or [""])[0])))
+                self.send_response(200)
+                self.send_header("Content-Type", ("application/json" if ext == "json" else "text/plain") + "; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Expose-Headers", "X-Repo-Revision")
+                self.send_header("X-Repo-Revision", str(snapshot["revision"]))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(content.encode("utf-8"))
+            except RepositoryError:
+                self._json(503, {"error": "仓库不可读，已暂停写入，请检查备份"})
             return
         # Serve checked proxies as txt: /api/checked/<token>.txt
         if path.startswith("/api/checked/") and path.endswith(".txt"):
@@ -2099,7 +2184,7 @@ class Handler(SimpleHTTPRequestHandler):
                 base_count = body.get("base_count", None)
 
                 if repo_data is not None:
-                    saved, response = save_repo_payload(token, repo_data, mode, base_count)
+                    saved, response = save_repo_payload(token, repo_data, mode, base_count, body.get("base_revision"))
                     if saved is None:
                         log.warning("Repo save rejected", extra={"token": token, "response": response})
                         self._json(200, response)
@@ -2109,7 +2194,7 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json(200, response)
                 else:
                     legacy_repo = [{"proxy": proxy} for proxy in proxies]
-                    saved, response = save_repo_payload(token, legacy_repo, mode, base_count)
+                    saved, response = save_repo_payload(token, legacy_repo, mode, base_count, body.get("base_revision"))
                     if saved is None:
                         log.warning("Repo save rejected", extra={"token": token, "response": response})
                         self._json(200, response)

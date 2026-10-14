@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import statistics
 import threading
@@ -347,21 +348,28 @@ class ProxyCheckEngine:
                         return
                     if _is_stopped(stop_event):
                         return
+                    started_at = int(time.time() * 1000)
                     result = await check_one(proxy)
-                    if result is not None:
-                        on_result(result)
+                    if result is not None and not _is_stopped(stop_event):
+                        result.update(started_at=started_at, completed_at=int(time.time() * 1000),
+                                      terminal_complete=True)
+                        pending = on_result(result)
+                        if inspect.isawaitable(pending):
+                            await pending
 
             tasks = [asyncio.create_task(worker()) for _ in range(worker_count)]
-            while tasks:
-                if _is_stopped(stop_event):
-                    await _cancel_tasks(tasks)
-                    return
-                pending = [task for task in tasks if not task.done()]
-                if not pending:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    return
-                tasks = pending
-                await asyncio.sleep(0.25)
+            try:
+                while tasks:
+                    if _is_stopped(stop_event):
+                        return
+                    for task in tasks:
+                        if task.done() and not task.cancelled() and task.exception():
+                            raise task.exception()
+                    if all(task.done() for task in tasks):
+                        return
+                    await asyncio.sleep(0.05)
+            finally:
+                await _cancel_tasks(tasks)
 
     def _single_proxy_timeout(self, rounds: int, profile: TargetProfile) -> int:
         # 单条代理的硬超时必须把服务探针重试与附加探针都算进去，否则会掐掉合法的探测。
@@ -404,6 +412,8 @@ class ProxyCheckEngine:
             ip_hint = discovered_ip if index == 0 else None
             round_results.append(self.check_once(proxy_input, profile, stop_event, self.config.timeout, ip_hint))
 
+        if _is_stopped(stop_event) or len(round_results) != total_rounds:
+            return None
         summary = ScoreAggregator(total_rounds, profile).summarize(round_results)
         protocol = proxy_input.split("://", 1)[0] if "://" in proxy_input else None
         return _build_public_result(proxy_input, original, protocol, profile, summary)
@@ -441,6 +451,8 @@ class ProxyCheckEngine:
             ip_hint = discovered_ip if index == 0 else None
             round_results.append(await self.check_once_async(proxy_input, profile, session, stop_event, self.config.timeout, ip_hint))
 
+        if _is_stopped(stop_event) or len(round_results) != total_rounds:
+            return None
         summary = ScoreAggregator(total_rounds, profile).summarize(round_results)
         protocol = proxy_input.split("://", 1)[0] if "://" in proxy_input else None
         return _build_public_result(proxy_input, original, protocol, profile, summary)

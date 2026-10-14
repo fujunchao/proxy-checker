@@ -5,7 +5,48 @@ Each source has a name, fetch function, and parser.
 import json
 import re
 import subprocess
+import time
+import urllib.request
 from curl_cffi import requests as cffi_requests
+
+
+def fetch_maintenance_source(source_index, stop_event):
+    """持续维护首版轮转纯文本源；字节、耗时和候选数都有上限。
+
+    不改变旧模式 all 的来源集合；不为抓取调用浏览器、Node 或未知脚本。
+    超限明确报错而不是永久截取来源头部。最多 50000 候选持久化后逐批消费。
+    """
+    sources = [s for s in PROXY_SOURCES if s.get("parser") == "plain"]
+    source = sources[source_index % len(sources)]
+    deadline = time.monotonic() + 20
+    chunks, size = [], 0
+    request = urllib.request.Request(source["url"], headers={"User-Agent": "PRX-maintenance"})
+    with urllib.request.urlopen(request, timeout=5) as response:
+        while not stop_event.is_set():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("来源读取超时")
+            chunk = response.read1(65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 4 * 1024 * 1024:
+                raise RuntimeError("来源超过 4 MiB 限额")
+            chunks.append(chunk)
+    if stop_event.is_set():
+        return [], "cancelled"
+    text = b"".join(chunks).decode("utf-8", errors="replace")
+    proxies, seen = [], set()
+    for match in PROXY_URL_RE.finditer(text):
+        proto, ip, port = match.groups()
+        chosen = source.get("protocol") or proto or ""
+        value = (chosen + "://" if chosen else "") + ip + ":" + port
+        if value in seen:
+            continue
+        seen.add(value)
+        proxies.append(value)
+        if len(proxies) > 50000:
+            raise RuntimeError("来源超过 50000 候选限额")
+    return proxies, source["id"]
 
 IP_PORT_RE = re.compile(r"(?<!\d)((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})(?!\d)")
 PROXY_URL_RE = re.compile(
