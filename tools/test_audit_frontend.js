@@ -62,12 +62,13 @@ function repoRead(b, rows, revision) {
         delete() {throw Error('合成的删除失败');}
       };}}; return tx;
     }};
+    a.context.window.indexedDB = {};
     a.context.resultsCacheDB = db;
     a.context.V = [{proxy:'http://192.0.2.1:80', valid:true}];
     a.context.saveResultsNow();
     a.context.V = []; a.context.clearResultsCache();
     oldTx.oncomplete();
-    const b = browser(shared); b.context.resultsCacheDB = db;
+    const b = browser(shared); b.context.window.indexedDB = {}; b.context.resultsCacheDB = db;
     await new Promise(resolve => b.context.loadSavedResults(resolve));
     assert.equal(b.context.V.length, 0, '清空标记不能被旧事务删除后恢复旧 IDB 结果');
   });
