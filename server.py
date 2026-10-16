@@ -612,6 +612,7 @@ def compact_run_log(entry):
         "valid_count", "unstable_count", "invalid_count", "repo_added", "repo_updated",
         "repo_removed", "error", "work_type", "incomplete_count", "conflict_skipped",
         "repo_revision", "last_published_at", "due_count", "discovery_pending",
+        "source_current_ids", "candidate_deduplicated", "candidate_filtered", "selection_seconds",
     ):
         value = entry.get(key)
         if value is not None and value != "":
@@ -1154,7 +1155,8 @@ MAINTENANCE_STATUS_FIELDS = ("work_type", "due_count", "unknown_age_count", "old
     "migration_required", "other_profile_count", "discovery_pending", "pending_count", "incomplete_count",
     "last_published_at", "repo_revision", "repo_added", "repo_updated", "repo_removed", "conflict_skipped",
     "last_progress_at", "source_error", "source_current_id", "source_last_id", "source_last_fetched_at",
-    "source_supported_count", "source_total_count", "maintenance_totals")
+    "source_supported_count", "source_total_count", "maintenance_totals", "source_current_ids",
+    "candidate_deduplicated", "candidate_filtered", "selection_seconds")
 
 
 def update_auto_runtime(token, **fields):
@@ -1381,6 +1383,7 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
     store = repo_store(token)
     engine = engine or check_engine
     source = source or fetch_maintenance_source
+    selection_started = timer_clock()
     state = store.maintenance()
     profile = config["target_profile"]
     if state.get("profile") != profile:
@@ -1406,7 +1409,9 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
     queues = DiscoveryQueues(state, maintenance_source_ids() if source_ids is None else source_ids)
     update_auto_runtime(token, source_supported_count=len(queues.ids), source_total_count=len(PROXY_SOURCES),
                         source_last_id=state.get("source_last_id"), source_error=None,
-                        source_last_fetched_at=state.get("source_last_fetched_at"), source_current_id=None)
+                        source_last_fetched_at=state.get("source_last_fetched_at"), source_current_id=None,
+                        source_count=0, source_current_ids=[], candidate_deduplicated=queues.duplicate_count,
+                        candidate_filtered=0, selection_seconds=0)
     selection_snapshot = store.snapshot()
     selection_epoch = selection_snapshot["epoch"]
     work_type, proxies, info = choose_batch(selection_snapshot, state, config, clock())
@@ -1419,21 +1424,15 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
         nonlocal proxies, selection_snapshot
         retry_turn = work_type == "discover" and state.get("discovery_retry_turn") and bool(state.get("retry_candidates"))
         if work_type == "discover":
+            key = None
             if retry_turn:
-                candidates = state.get("retry_candidates", [])
-                proxies = candidates[:config["discover_batch"]]
-                state["retry_candidates"] = candidates[len(proxies):]
                 update_auto_runtime(token, source_current_id="未完成重试", source_count=0)
             else:
                 key = queues.next_source(clock())
                 if key is None:
                     runtime["next_delay"] = 10
-                    state["discovery_retry_turn"] = True
-                    if not runtime["stop"].is_set():
-                        await asyncio.to_thread(store.maintenance, state)
-                    return {}, []
                 update_auto_runtime(token, source_current_id=key, source_count=0)
-                if not queues.queues.get(key):
+                if key is not None and not queues.queues.get(key):
                     update_auto_runtime(token, stage="fetching")
                     event = {"id": uuid.uuid4().hex, "ok": False, "count": 0}
                     try:
@@ -1462,11 +1461,6 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
                     log.info("maintenance source workspace=%s run=%s source=%s ok=%s candidates=%s",
                              hashlib.sha256(token.encode()).hexdigest()[:10], runtime["run_id"], key,
                              event["ok"], event["count"])
-                    if not event["ok"]:
-                        state["discovery_retry_turn"] = True
-                        await asyncio.to_thread(store.maintenance, state)
-                        return {}, []
-                proxies = queues.take(key, config["discover_batch"])
             if runtime["stop"].is_set():
                 return {}, []
             selection_snapshot = await asyncio.to_thread(store.snapshot)
@@ -1475,16 +1469,25 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
             # 存量只由 refresh 管理；缺档位和其他档位不因发现同址而被迁移。
             existing_keys = {proxy_key(i["proxy"]) for i in selection_snapshot["items"]}
             checked = set(map(proxy_key, read_checked_list(token))) if config["detect_mode"] == "skip" else set()
-            before = len(proxies)
-            proxies = [p for p in proxies if proxy_key(p) not in checked and proxy_key(p) not in existing_keys]
+            proxies = queues.select(key, config["discover_batch"], existing_keys | checked, retry_turn)
             state["discovery_retry_turn"] = not retry_turn
-            update_auto_runtime(token, skipped=before - len(proxies),
+            update_auto_runtime(token, skipped=queues.filtered_count,
                                 discovery_pending=discovery_pending(state))
         if runtime["stop"].is_set():
             return {}, []
+        selected_sources = queues.sources_for(proxies) if work_type == "discover" else []
+        selection_seconds = round(max(0, timer_clock() - selection_started), 3)
+        update_auto_runtime(token, source_current_ids=selected_sources,
+                            candidate_deduplicated=queues.duplicate_count,
+                            candidate_filtered=queues.filtered_count, selection_seconds=selection_seconds)
+        oldest_age = max(0, int(clock() - info["oldest_checked_at"])) if info["oldest_checked_at"] is not None else None
+        log.info("maintenance selection workspace=%s run=%s type=%s selected=%s filtered=%s deduplicated=%s sources=%s oldest_age_seconds=%s selection_seconds=%s",
+                 hashlib.sha256(token.encode()).hexdigest()[:10], runtime["run_id"], work_type, len(proxies),
+                 queues.filtered_count, queues.duplicate_count, len(selected_sources), oldest_age, selection_seconds)
         # 先存游标及在途输入：进程退出后不重放内存成功观测，输入回到有界队尾。
         state.update(inflight_type=work_type, inflight_inputs=proxies,
                      inflight_queue="retry" if retry_turn else "source")
+        queues.compact()
         await asyncio.to_thread(store.maintenance, state)
         update_auto_runtime(token, total=len(proxies), input_count=len(proxies), stage="detecting")
         if not proxies:
@@ -1497,6 +1500,7 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
             state.pop("inflight_type", None)
             state.pop("inflight_inputs", None)
             state.pop("inflight_queue", None)
+            queues.compact()
             await asyncio.to_thread(store.maintenance, state)
             update_auto_runtime(token, conflict_skipped=len(proxies), incomplete_count=len(proxies))
             return {"conflict_skipped": len(proxies), "incomplete_count": len(proxies)}, []
@@ -1515,6 +1519,8 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
                 queue_retry(unfinished)
             else:
                 retry = state.setdefault("retry_after", {})
+                # 尝试集合只保护未完成项；成功完成后再次到期应按真实检测时间重新排期。
+                state["refresh_seen"] = sorted(set(state.get("refresh_seen", [])) - complete_keys)
                 for proxy in completed:
                     retry.pop(proxy_key(proxy), None)
                 for proxy in unfinished:
@@ -1523,6 +1529,7 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
                 state.pop("inflight_type", None)
                 state.pop("inflight_inputs", None)
                 state.pop("inflight_queue", None)
+                queues.compact()
                 await asyncio.to_thread(store.maintenance, state)
                 # 批次末重新统计真实到期情况，轮询只计算年龄，不扫描大结果集。
                 _, _, after = choose_batch(store.snapshot(), dict(state), config, clock())

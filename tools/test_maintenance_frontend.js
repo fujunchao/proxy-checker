@@ -41,6 +41,21 @@ assert.match(w.document.getElementById('autoProgress').textContent, /累计移�
 assert.match(w.document.getElementById('autoProgress').textContent, /来源覆盖 22\/33/);
 assert.match(w.document.getElementById('autoProgress').textContent, /最近抓取.*databay_http/);
 assert.match(w.document.getElementById('autoProgress').textContent, /本批新拉取 0/);
+
+// 多来源缓存补量必须保留本批口径；来源名称作为文本显示，不能注入页面。
+w.renderAutoProgress({config: {maintenance_mode: 'continuous', target_profile: 'zai'},
+  state: {total: 200, source_count: 0, source_current_id: 'one',
+    source_current_ids: ['one', 'two<img src=x onerror=alert(1)>'],
+    candidate_deduplicated: 12, candidate_filtered: 8, selection_seconds: 0.25}});
+assert.match(progress.textContent, /本批来源 one、two<img src=x onerror=alert\(1\)>/);
+assert.match(progress.textContent, /有效输入 200/);
+assert.match(progress.textContent, /过滤库存／历史 8/);
+assert.match(progress.textContent, /合并重复候选 12/);
+assert.match(progress.textContent, /选批（含抓取） 0\.25 秒/);
+assert.equal(progress.querySelector('img'), null);
+w.renderAutoProgress({config: {maintenance_mode: 'continuous'}, state: {source_current_id: 'legacy_source'}});
+assert.match(progress.textContent, /本批来源 legacy_source/);
+assert.doesNotMatch(progress.textContent, /合并重复候选/, '旧状态不应把缺失指标伪装成零');
 b.reply(pending, {config: {enabled: false}, state: {}, new: []});
 assert.equal(w.autoStatusCache.config.enabled, true, '旧摘要不能覆盖更新的配置响应');
 

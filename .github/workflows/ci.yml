@@ -47,10 +47,13 @@ jobs:
       - name: 发现公平性回归
         if: ${{ !cancelled() }}
         run: python tools/test_discovery_fairness.py 2>&1 | tee artifacts/discovery-fairness.log
+      - name: 并发利用率、补量和恢复回归
+        if: ${{ !cancelled() }}
+        run: python tools/test_maintenance_pipeline.py 2>&1 | tee artifacts/maintenance-pipeline.log
       - name: 语法与前端回归
         run: |
           mkdir -p artifacts
-          python -m py_compile server.py proxy_check.py repository.py maintenance.py tools/test_workspace.py tools/smoke.py
+          python -m py_compile server.py proxy_check.py repository.py maintenance.py tools/test_maintenance_pipeline.py tools/test_workspace.py tools/smoke.py
           node --check app.js
           node tools/test_workspace_frontend.js 2>&1 | tee artifacts/frontend.log
           node tools/test_result_performance.js 2>&1 | tee artifacts/result-performance.log

@@ -109,9 +109,10 @@ class DiscoveryFairness(unittest.TestCase):
             'source_next': 'two', 'inflight_type': 'discover', 'inflight_queue': 'source',
             'inflight_inputs': [item(1)['proxy'], item(2)['proxy']], 'discovery_retry_turn': True})
         self.run_batch()
-        self.assertEqual(self.checked, [item(2)['proxy']])
+        self.assertEqual(self.checked, [item(2)['proxy'], item(3)['proxy']],
+                         '恢复输入优先，剩余批量可使用其他来源缓存，不重放已提交成功')
         self.assertEqual(self.visited, [])
-        self.assertEqual(self.store.maintenance()['source_queues']['one'], [item(3)['proxy']])
+        self.assertEqual(self.store.maintenance()['source_queues']['one'], [])
         self.assertNotIn('pass_streak', self.store.snapshot()['items'][0])
 
     def test_slow_inputs_are_retried_without_pinning_the_next_source(self):
@@ -149,8 +150,9 @@ class DiscoveryFairness(unittest.TestCase):
         self.config['discover_batch'] = 2
         with patch('maintenance.MAX_SOURCE_CANDIDATES', 8):
             self.run_batch()  # 第一源接纳六条，余四条。
-            self.run_batch()  # 第二源不能完整接纳，不能截成前四条。
-            self.assertEqual(len(self.store.maintenance()['source_queues']['one']), 4)
+            self.run_batch()  # 第二源不能完整接纳；继续检测原队列，不空耗本批。
+            self.assertEqual(len(self.store.maintenance()['source_queues']['one']), 2)
+            self.assertEqual(len(self.checked), 4, '已接纳的唯一候选只能被检测消费，不能被容量处理丢弃')
             self.assertNotIn('two', self.store.maintenance()['source_queues'])
             self.assertIn('容量不足', server.auto_runtime[self.token]['source_error'])
             self.run_batch()  # 原队列继续排空，为下一来源腾出空间。

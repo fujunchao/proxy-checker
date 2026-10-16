@@ -1601,7 +1601,11 @@ function renderAutoProgress(data){
     html+='<div>发现队列 '+value(state.discovery_pending)+' · 待发布 '+value(state.pending_count)+' · 任务级未完成 '+value(state.incomplete_count)+'</div>';
     html+='<div>已发布仓库 '+value(state.repo_count)+' · 版本 '+value(state.repo_revision)+' · 最近发布 '+(state.last_published_at?esc(formatAutoTime(state.last_published_at/1000,tz)):'尚无发布')+'</div>';
     html+='<div>本批提交: 新增 '+value(state.repo_added)+' / 更新 '+value(state.repo_updated)+' / 移除 '+value(state.repo_removed)+' / 冲突跳过 '+value(state.conflict_skipped)+'</div>';
-    html+='<div>来源覆盖 '+value(state.source_supported_count)+'/'+value(state.source_total_count)+'（持续维护仅纯文本源） · 本批来源 '+esc(state.source_current_id||'存量／等待中')+'</div>';
+    var batchSources=Array.isArray(state.source_current_ids)&&state.source_current_ids.length?state.source_current_ids.join('、'):state.source_current_id;
+    html+='<div>来源覆盖 '+value(state.source_supported_count)+'/'+value(state.source_total_count)+'（持续维护仅纯文本源） · 本批来源 '+esc(batchSources||'存量／等待中')+'</div>';
+    if(state.candidate_deduplicated!==undefined||state.candidate_filtered!==undefined||state.selection_seconds!==undefined){
+      html+='<div>本批选批: 有效输入 '+value(state.total)+' · 过滤库存／历史 '+value(state.candidate_filtered)+' · 合并重复候选 '+value(state.candidate_deduplicated)+' · 选批（含抓取） '+value(state.selection_seconds)+' 秒</div>';
+    }
     html+='<div>最近抓取: '+(state.source_last_fetched_at?esc(formatAutoTime(state.source_last_fetched_at/1000,tz))+' · '+esc(state.source_last_id||'-'):'尚无升级后记录')+'</div>';
     var totals=state.maintenance_totals||{};
     if(totals.since){
@@ -1673,7 +1677,7 @@ function showAutoModal(data){
   html+='<div class="auto-form">';
   html+='<div class="auto-field full"><label><input id="autoEnabled" type="checkbox" '+(config.enabled?'checked':'')+' style="width:auto;height:auto;margin-right:8px">启用后台自动检测</label></div>';
   html+='<div class="auto-field full"><label>运行方式</label><select id="autoMaintenanceMode"><option value="legacy">旧模式：按计划完成整轮后发布</option><option value="continuous">持续维护（推荐）：存量优先、发现分批、中途发布</option></select></div>';
-  html+='<div class="auto-field full"><div class="settings-note">持续维护：存量目标 15 分钟复测一次，不受已检测历史跳过；默认连续复测耗时达到 120 秒即让出发现机会，零散到期项不连续占批。来源每个小批次轮转；每批存量最多 100 / 发现最多 200，预算 120 秒，每 20 条或 10 秒发布。旧时间规则仅旧模式生效；停止后等待再次保存或立即运行。</div></div>';
+  html+='<div class="auto-field full"><div class="settings-note">持续维护：存量目标 15 分钟复测一次，不受已检测历史跳过；默认连续复测耗时达到 120 秒即让出发现机会，零散到期项不连续占批。主来源公平轮转，待检跨源去重、过滤后从其他缓存补量；每批最多新抓取一个来源，不等待凑满。每批存量最多 100 / 发现最多 200，预算 120 秒，每 20 条或 10 秒发布。旧时间规则仅旧模式生效；停止后等待再次保存或立即运行。</div></div>';
   html+='<div class="auto-field"><label>时间规则</label><select id="autoScheduleType" onchange="updateAutoScheduleFields()"><option value="interval" '+(config.schedule_type==='interval'?'selected':'')+'>每隔 N 小时</option><option value="daily" '+(config.schedule_type==='daily'?'selected':'')+'>每天固定时间</option></select></div>';
   html+='<div class="auto-field" id="autoIntervalField"><label>间隔小时</label><input id="autoIntervalHours" type="number" min="0.01" max="720" step="0.25" value="'+esc(config.interval_hours||6)+'"></div>';
   html+='<div class="auto-field" id="autoDailyField"><label>固定时间（计划时区）</label><input id="autoDailyTime" type="time" value="'+esc(config.daily_time||'03:00')+'"></div>';

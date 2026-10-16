@@ -18,7 +18,7 @@ def discovery_pending(state):
 
 
 class DiscoveryQueues:
-    """来源独立游标：一批就轮转，读源与检测分离，所有已接纳输入可恢复。"""
+    """来源公平轮转，共享待检身份和来源归属；所有唯一输入均可恢复。"""
     def __init__(self, state, source_ids):
         self.state = state
         self.ids = list(source_ids)
@@ -30,6 +30,33 @@ class DiscoveryQueues:
             key = self.ids[previous] if self.ids else "legacy_retired"
             self.queues[key] = list(dict.fromkeys(self.queues.get(key, []) + legacy))
         state.update(candidates=[], cursor=0)
+        self.duplicate_count = 0
+        self.filtered_count = 0
+        self.pending = set()
+        old_sources = state.get("candidate_sources", {})
+        self.sources = {}
+
+        def unique(values, source=None):
+            out = []
+            for value in values:
+                key = endpoint(value)
+                owners = self.sources.setdefault(key, list(old_sources.get(key, [])))
+                if source is not None and source not in owners:
+                    owners.append(source)
+                if key in self.pending:
+                    self.duplicate_count += 1
+                else:
+                    self.pending.add(key)
+                    out.append(value)
+            return out
+
+        # 重试和在途项先占有身份，来源中的同一项合并归属，不另排一次检测。
+        state["retry_candidates"] = unique(state.get("retry_candidates", []))
+        if state.get("inflight_inputs"):
+            state["inflight_inputs"] = unique(state["inflight_inputs"])
+        for source, values in self.queues.items():
+            self.queues[source] = unique(values, source)
+        state["candidate_sources"] = self.sources
         # 来源删除后仍排空已接纳候选，但不再次抓取退役来源。
         self.ring = self.ids + sorted(k for k, q in self.queues.items() if q and k not in self.ids)
         self.cooldowns = state.setdefault("source_cooldowns", {})
@@ -51,16 +78,77 @@ class DiscoveryQueues:
     def admit(self, key, candidates, now):
         if len(candidates) > 50000:
             raise RepositoryError("单个来源超过 50000 候选，未接纳该来源")
-        if sum(map(len, self.queues.values())) + len(candidates) > MAX_SOURCE_CANDIDATES:
+        if self.queues.get(key):
+            raise RepositoryError("来源仍有待检候选，未覆盖已接纳输入")
+        additions, identities = [], set(self.pending)
+        for candidate in candidates:
+            identity = endpoint(candidate)
+            if identity not in identities:
+                identities.add(identity)
+                additions.append(candidate)
+        if sum(map(len, self.queues.values())) + len(additions) > MAX_SOURCE_CANDIDATES:
             raise RepositoryError("来源队列容量不足，未接纳该来源；其他来源继续轮转")
-        self.queues[key] = candidates
+        # 容量检查成功后才更新队列及归属，超限不能只接纳前缀或修改原有记录。
+        for candidate in candidates:
+            owners = self.sources.setdefault(endpoint(candidate), [])
+            if key not in owners:
+                owners.append(key)
+        self.duplicate_count += len(candidates) - len(additions)
+        self.pending = identities
+        self.queues[key] = additions
         self.cooldowns[key] = now + SOURCE_REFETCH_SECONDS
 
-    def take(self, key, limit):
-        candidates = self.queues.get(key, [])
-        selected = candidates[:limit]
-        self.queues[key] = candidates[limit:]
+    def _consume(self, candidates, limit, blocked):
+        selected, cursor = [], 0
+        while cursor < len(candidates) and len(selected) < limit:
+            candidate = candidates[cursor]
+            cursor += 1
+            if endpoint(candidate) in blocked:
+                self.filtered_count += 1
+            else:
+                selected.append(candidate)
+        return selected, candidates[cursor:]
+
+    def take(self, key, limit, blocked=()):
+        selected, self.queues[key] = self._consume(self.queues.get(key, []), limit, blocked)
         return selected
+
+    def select(self, primary, limit, blocked, retry_first=False):
+        """只从已接纳队列补量；不读网络，也不移动下一主来源的公平游标。"""
+        selected = []
+
+        def take_retry():
+            values, self.state["retry_candidates"] = self._consume(
+                self.state.get("retry_candidates", []), limit - len(selected), blocked)
+            selected.extend(values)
+
+        if retry_first:
+            take_retry()
+        if primary is not None and self.queues.get(primary) and len(selected) < limit:
+            selected.extend(self.take(primary, limit - len(selected), blocked))
+        start = self.state.get("source_next")
+        offset = self.ring.index(start) if start in self.ring else 0
+        for key in self.ring[offset:] + self.ring[:offset]:
+            if len(selected) >= limit:
+                break
+            if key != primary and self.queues.get(key):
+                selected.extend(self.take(key, limit - len(selected), blocked))
+        if not retry_first and len(selected) < limit:
+            take_retry()
+        return selected
+
+    def sources_for(self, proxies):
+        return list(dict.fromkeys(source for proxy in proxies
+                                  for source in self.sources.get(endpoint(proxy), [])))
+
+    def compact(self):
+        """来源归属只伴随待检、重试和在途输入，不累计永久端点历史。"""
+        live = {endpoint(p) for values in self.queues.values() for p in values}
+        live.update(endpoint(p) for p in self.state.get("retry_candidates", []))
+        live.update(endpoint(p) for p in self.state.get("inflight_inputs", []))
+        self.sources = {key: owners for key, owners in self.sources.items() if key in live}
+        self.state["candidate_sources"] = self.sources
+        self.pending = live
 
 
 class FairBudget:
@@ -239,16 +327,28 @@ def choose_batch(snapshot, state, config, now):
     rows = [i for i in snapshot["items"] if i.get("target_profile") == profile]
     retry = state.setdefault("retry_after", {})
     keys = {endpoint(i["proxy"]) for i in rows}
+    attempts = state.get("refresh_attempted_at")
+    if attempts is None:
+        # 旧集合混有已经完成的节点；退避记录只保留未完成或中断时正在尝试的项。
+        attempts = {k: int((v - min(60, interval)) * 1000) for k, v in retry.items() if k in keys}
+    seen = set(state.get("refresh_seen", [])) & keys
+    seen = {endpoint(i["proxy"]) for i in rows if endpoint(i["proxy"]) in seen
+            and endpoint(i["proxy"]) in attempts
+            and (not i.get("last_checked_at") or i["last_checked_at"] < attempts[endpoint(i["proxy"])])}
+    # 已提交结果即使在清理尝试状态前重启，也能用真实完成时间解除旧标记。
+    attempts = {k: v for k, v in attempts.items() if k in seen}
     retry = state["retry_after"] = {k: v for k, v in retry.items() if k in keys and v > now}
     due = [i for i in rows if not i.get("last_checked_at") or now - i["last_checked_at"] / 1000 >= interval]
     due.sort(key=lambda i: (i.get("last_checked_at", 0), endpoint(i["proxy"])))
     eligible = [i for i in due if endpoint(i["proxy"]) not in retry]
     # 一轮内只尝试同一存量一次，不能因长批次让选批时的退避过期而反复占据前缀。
-    seen = set(state.get("refresh_seen", [])) & keys
     untried = [i for i in eligible if endpoint(i["proxy"]) not in seen]
     if not untried and eligible:
         seen.clear()
+        attempts.clear()
         untried = eligible
+    state["refresh_seen"] = sorted(seen)
+    state["refresh_attempted_at"] = attempts
     known = [i["last_checked_at"] / 1000 for i in rows if i.get("last_checked_at")]
     info = {"due_count": len(due), "unknown_age_count": len(rows) - len(known),
             "oldest_checked_at": min(known) if known else None,
@@ -262,6 +362,7 @@ def choose_batch(snapshot, state, config, now):
         selected = [i["proxy"] for i in untried[:config["refresh_batch"]]]
         for p in selected:
             retry[endpoint(p)] = now + min(60, interval)
+            attempts[endpoint(p)] = int(now * 1000)
         seen.update(map(endpoint, selected))
         state["refresh_seen"] = sorted(seen)
         state["refresh_streak"] = state.get("refresh_streak", 0) + 1
