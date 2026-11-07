@@ -7,13 +7,17 @@
   4) 进程内 TTL 缓存（D3）：TTL 内命中不搬 body；TTL=0 关闭缓存
   5) 成本闸门（D5）：服务不可达的线路不烧 2MiB
   6) 公共结果透传：up_kbps / up_error（成功条目与失败条目都要有这两个键）
-  7) 硬超时预算：启用测速后变大且 ≤180，关闭时回到原值
+  7) 硬超时预算：启用测速后变大且 <=180，关闭时回到原值
   8) 方向验证：本地限速 HTTP CONNECT 代理（令牌桶，默认 200KB/s），
      让 _probe_uplink_async 经它打 https://speed.cloudflare.com/__up，
      断言读数落在 [0.5x, 3x]。无外网则打印 SKIP，不判失败。
   9) 预算截断：60KB/s 线 + 8s 预算，验证「发不满 2MiB 也能出读数」与外层硬闸生效。
   10) 并发闸（防宿主上行争用）：上限生效、拿不到名额时跳过且不发流量、
      名额归还、复用/缓存命中不占名额、同步路径同语义。
+  11) 宿主直连基线饱和截断：自动基线取中位、超基线截断、不稳定/测不出则不截断、
+     人工基线/关闭截断、基线自身不被截断、截断不改变门禁结论、同步路径同语义。
+  12) 先连通再测速：required_probes 不通过时一个字节都不发、门禁通过才测、
+     非测速档位执行次序不变、同步路径同语义。
 
 用法：
     python tools/test_uplink.py
@@ -26,6 +30,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import socket
 import sys
@@ -33,9 +38,22 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+# Windows 控制台默认编码可能是 GBK，输出里的「=>」「约」这类符号会抛 UnicodeEncodeError，
+# 那是**打印**把测试判成失败（在 pytest/CI 的 UTF-8 下看不出来）。
+# 这里把 stdout/stderr 统一改成 utf-8 + replace，打印永远不该是失败原因。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, OSError, ValueError):
+        pass
+
 # 本脚本的门禁用例需要测速开关为开；在 import proxy_check 之前定死，
 # 因为 UPLINK_PROBE_ENABLED 是 import 期求值的模块常量。
 os.environ["UPLINK_PROBE"] = "1"
+# 默认关闭「宿主基线饱和截断」（UPLINK_BASELINE_KBPS=-1）：否则每个首次探针都会
+# 额外烧 3 段 2MiB 直连流量，把「搬了几次 body」的计数断言全部带偏。
+# 截断相关行为在第 11 节里显式打开再测。
+os.environ["UPLINK_BASELINE_KBPS"] = "-1"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -511,7 +529,12 @@ def test_cost_gate() -> None:
     result = asyncio.run(run())
     check("服务不可达 → 完全不搬 body", fake.calls == 0, fake.calls)
     check("服务不可达 → up_kbps 为 None", result.up_kbps is None)
-    check("服务不可达 → 不写 uplink 明细", "uplink" not in result.checks_detail)
+    check("服务不可达 → 只记「跳过 + 原因」，不记任何读数",
+          result.checks_detail.get("uplink", {}).get("skipped") is True
+          and result.checks_detail["uplink"].get("reason") == "not_reachable"
+          and "kbps" not in result.checks_detail["uplink"],
+          result.checks_detail.get("uplink"))
+    check("服务不可达 → up_error 说明跳过原因", result.up_error == "not_reachable", result.up_error)
 
     stopped = make_engine()
     fake_stop = FakeSession()
@@ -589,6 +612,10 @@ def test_timeout_budget() -> None:
     check("uplink_budget 可配置（98 + 25 = 123）",
           custom_budget._single_proxy_timeout(2, ZAI) == 123,
           custom_budget._single_proxy_timeout(2, ZAI))
+
+    # 「先连通、再测速」把首轮变成 service(24)+aux(12)+max(api, uplink 40)=76s 的串行路径，
+    # 后续轮 48s；硬超时必须 >= 120s 才不会被掐死（当前 138s）。
+    check("新执行次序下 2 轮 zai 硬超时 >= 76 + 44 = 120", zai_on >= 120, zai_on)
 
 
 # ── 8. 方向验证：本地限速 CONNECT 代理 ─────────────────────────────────────
@@ -731,7 +758,7 @@ def test_direction() -> None:
     started = time.time()
     try:
         _direction_run(engine, result, f"http://127.0.0.1:{proxy.port}")
-    except Exception as exc:  # noqa: BLE001 —— 环境问题一律 SKIP，不让 CLI 门禁变红
+    except Exception as exc:  # noqa: BLE001 -- 环境问题一律 SKIP，不让 CLI 门禁变红
         skip("方向验证", f"{type(exc).__name__}: {exc}")
         return
     finally:
@@ -747,11 +774,11 @@ def test_direction() -> None:
     # 先判断「仪器」本身在这台机器上成立与否：限速代理是按 8KB 一块慢慢转发的，
     # 只有当整段耗时接近理论值（2MiB ÷ rate）时，链路才真的被限速。
     # 反过来，如果代理确实慢慢转发（elapsed 接近理论值）而客户端读数仍然远高于真值，
-    # 说明内核 TCP 缓冲把载荷整段吞掉了（Linux 默认 sndbuf/rcvbuf 可达数 MB）——
+    # 说明内核 TCP 缓冲把载荷整段吞掉了（Linux 默认 sndbuf/rcvbuf 可达数 MB）--
     # 此时「测到的是缓冲填充速率」是物理事实，不是实现 bug，只能跳过本环境的稳态断言。
     theoretical = (2 * 1024 * 1024) / (rate_kbps * 1024.0)
     proxy_paced = elapsed >= theoretical * 0.5
-    print(f"  实测: up_kbps={result.up_kbps}KB/s  真值≈{rate_kbps}KB/s  "
+    print(f"  实测: up_kbps={result.up_kbps}KB/s  真值约{rate_kbps}KB/s  "
           f"耗时={elapsed:.1f}s（理论 {theoretical:.1f}s）  经代理字节={proxy.forwarded_bytes}")
     if result.up_kbps > high and proxy_paced:
         skip("方向验证的稳态断言",
@@ -774,7 +801,7 @@ def test_budget_truncation() -> None:
     if str(os.environ.get("UPLINK_TEST_LOCAL", "1")).strip().lower() in ("0", "false", "off", "no"):
         skip("预算截断", "已用 UPLINK_TEST_LOCAL=0 关闭")
         return
-    rate_kbps = 60          # 2MiB 在本预算内必然发不完（60KB/s × 8s ≈ 480KB）
+    rate_kbps = 60          # 2MiB 在本预算内必然发不完（60KB/s x 8s 约 480KB）
     budget = 8
     proxy = ThrottledConnectProxy(rate_kbps=rate_kbps)
     engine = make_engine(check_rounds=1, uplink_budget=budget, timeout=10, detect_timeout=5)
@@ -795,12 +822,12 @@ def test_budget_truncation() -> None:
 
     detail = result.checks_detail.get("uplink", {})
     written = int(detail.get("written") or 0)
-    print(f"  实测: up_kbps={result.up_kbps}KB/s  真值≈{rate_kbps}KB/s  耗时={elapsed:.1f}s  "
+    print(f"  实测: up_kbps={result.up_kbps}KB/s  真值约{rate_kbps}KB/s  耗时={elapsed:.1f}s  "
           f"written={written}")
     check("慢线发不满 2MiB 也能出读数（里程碑版的核心价值）", result.up_kbps is not None,
           result.up_kbps)
     # 这个用例要测的是「预算内发不满 2MiB」时的行为。若本环境内核缓冲把 2MiB 整段吞掉，
-    # 载荷根本不会触顶预算（written 会等于 2MiB），前提不成立 ⇒ 跳过依赖前提的三条断言，
+    # 载荷根本不会触顶预算（written 会等于 2MiB），前提不成立  =>  跳过依赖前提的三条断言，
     # 而不是把它们判成实现失败（GitHub runner 上就是这个情形）。
     if written >= 2 * 1024 * 1024:
         skip("预算截断的三条断言",
@@ -954,6 +981,332 @@ def test_concurrency_gate() -> None:
         proxy_check.cffi_requests = original_http
 
 
+# ── 11. 宿主直连基线饱和截断 ──────────────────────────────────────────────
+def _marks_at(kbps: int, total_bytes: int = 2 * 1024 * 1024,
+              chunk_bytes: int = 64 * 1024) -> List[Tuple[int, float]]:
+    """构造「稳定在 kbps」的里程碑，_uplink_rate 应精确读回该值。
+
+    注意单位约定（与实现一致）：_uplink_rate 用「字节 ÷ 毫秒」，1 字节/毫秒 = 1 kB/s
+    （十进制，千字节按 1000B 计）。所以这里的耗时是 `字节数 ÷ kbps` 毫秒。
+    """
+    marks: List[Tuple[int, float]] = []
+    sent = 0
+    elapsed_ms = 0.0
+    while sent < total_bytes:
+        step = min(chunk_bytes, total_bytes - sent)
+        elapsed_ms += step / kbps
+        sent += step
+        marks.append((sent, elapsed_ms))
+    return marks
+
+
+def _install_fake_transfer(engine, *, line_kbps: int, baseline_kbps: Sequence[int],
+                           sync: bool = False) -> Dict[str, int]:
+    """把传输主体换成替身：直连（proxy 为空 dict）按 baseline_kbps 依次取值，经代理固定 line_kbps。
+
+    基线测试不需要真实流量，只需要「可控的里程碑」；这样连 3 次直连读数的稳定性
+    也可以精确构造，不依赖网络与机器负载。
+    """
+    calls = {"direct": 0, "line": 0}
+    baseline_seq = list(baseline_kbps)
+
+    def build(proxy: Mapping[str, str]):
+        if proxy:
+            calls["line"] += 1
+            rate = line_kbps
+        else:
+            index = min(calls["direct"], max(0, len(baseline_seq) - 1))
+            calls["direct"] += 1
+            rate = baseline_seq[index] if baseline_seq else 0
+        if not rate:
+            return [], 200, None, 500.0
+        return _marks_at(rate), 200, None, 500.0
+
+    if sync:
+        def fake_sync(proxy, stop_event=None, budget=None):
+            return build(proxy)
+
+        engine._transfer_uplink_sync = fake_sync  # type: ignore[method-assign]
+    else:
+        async def fake_async(session, proxy, stop_event=None, budget=None):
+            return build(proxy)
+
+        engine._transfer_uplink_async = fake_async  # type: ignore[method-assign]
+    return calls
+
+
+def _probe_once(engine, proxy_url: str) -> RoundResult:
+    result = RoundResult(service_reachable=True)
+    asyncio.run(engine._probe_uplink_async(FakeSession(), result, ZAI, {"https": proxy_url}))
+    return result
+
+
+def _gate_round(up_kbps: Optional[int]) -> RoundResult:
+    return RoundResult(
+        service_reachable=True,
+        api_reachable=True,
+        cf_bypass=True,
+        aux={"zcode": True},
+        status_code=200,
+        ip="1.2.3.4",
+        latency=100,
+        up_kbps=up_kbps,
+    )
+
+
+def test_baseline_saturation() -> None:
+    section("11. 宿主直连基线饱和截断")
+    original = (proxy_check.UPLINK_BASELINE_KBPS, proxy_check.UPLINK_BASELINE_RUNS,
+                proxy_check.UPLINK_BASELINE_STABILITY)
+    try:
+        proxy_check.UPLINK_BASELINE_KBPS = 0          # 自动测
+        proxy_check.UPLINK_BASELINE_RUNS = 3
+        proxy_check.UPLINK_BASELINE_STABILITY = 40
+
+        # 11.1 自动基线 = 3 次直连读数的中位；超基线被截断
+        engine = make_engine()
+        calls = _install_fake_transfer(engine, line_kbps=7142, baseline_kbps=[3400, 3430, 3460])
+        hot = _probe_once(engine, "http://10.11.0.1:8080")
+        check("自动基线 = 3 次直连读数的中位 3430（基线自身不被截断）",
+              engine._uplink_baseline == 3430, engine._uplink_baseline)
+        check("基线只测一轮、共 3 次直连", calls["direct"] == 3, calls["direct"])
+        check("7142KB/s 的假高值被截断到基线 3430", hot.up_kbps == 3430, hot.up_kbps)
+        detail = hot.checks_detail.get("uplink", {})
+        check("截断标记 saturated / raw_kbps / baseline_kbps 齐全",
+              detail.get("saturated") is True and detail.get("raw_kbps") == 7142
+              and detail.get("baseline_kbps") == 3430, detail)
+        check("截断后的值写进 detail.kbps（落库用的就是这个值）",
+              detail.get("kbps") == 3430, detail.get("kbps"))
+
+        # 11.2 低于基线的读数原样保留（只降不升）
+        engine_low = make_engine()
+        _install_fake_transfer(engine_low, line_kbps=2000, baseline_kbps=[3400, 3430, 3460])
+        low = _probe_once(engine_low, "http://10.11.0.2:8080")
+        check("低于基线的读数原样保留（只降不升）", low.up_kbps == 2000, low.up_kbps)
+        check("未截断时不写 saturated", "saturated" not in low.checks_detail.get("uplink", {}),
+              low.checks_detail.get("uplink"))
+        check("未截断时仍记 baseline_kbps（便于排查）",
+              low.checks_detail["uplink"].get("baseline_kbps") == 3430,
+              low.checks_detail.get("uplink"))
+
+        # 11.3 基线不稳定（3 次里 1100 偏离中位 67%） =>  不截断
+        engine_unstable = make_engine()
+        _install_fake_transfer(engine_unstable, line_kbps=7142, baseline_kbps=[3400, 1100, 3400])
+        unstable = _probe_once(engine_unstable, "http://10.11.0.3:8080")
+        check("基线不稳定  =>  弃用（_uplink_baseline=None）", engine_unstable._uplink_baseline is None,
+              engine_unstable._uplink_baseline)
+        check("不稳定  =>  不截断，保留原始 7142（宁可留假高值也不错截）",
+              unstable.up_kbps == 7142, unstable.up_kbps)
+        check("不稳定  =>  detail 标 baseline_unavailable",
+              unstable.checks_detail["uplink"].get("baseline_unavailable") is True,
+              unstable.checks_detail.get("uplink"))
+
+        # 11.4 基线测不出来  =>  不截断 + unavailable
+        engine_fail = make_engine()
+        _install_fake_transfer(engine_fail, line_kbps=7142, baseline_kbps=[])
+        failed = _probe_once(engine_fail, "http://10.11.0.4:8080")
+        check("基线测不出来  =>  不截断", failed.up_kbps == 7142 and engine_fail._uplink_baseline is None,
+              (failed.up_kbps, engine_fail._uplink_baseline))
+        check("基线不可用  =>  detail 标 baseline_unavailable",
+              failed.checks_detail["uplink"].get("baseline_unavailable") is True,
+              failed.checks_detail.get("uplink"))
+
+        # 11.5 人工基线 >0：直接用，不触发直连测量
+        proxy_check.UPLINK_BASELINE_KBPS = 2000
+        engine_manual = make_engine()
+        calls_manual = _install_fake_transfer(engine_manual, line_kbps=7142, baseline_kbps=[3400])
+        manual = _probe_once(engine_manual, "http://10.11.0.5:8080")
+        check("人工基线 2000 直接生效（截到 2000）", manual.up_kbps == 2000, manual.up_kbps)
+        check("人工基线不触发直连测量", calls_manual["direct"] == 0, calls_manual["direct"])
+
+        # 11.6 关闭截断 <0：不测基线、不截断、不算 unavailable
+        proxy_check.UPLINK_BASELINE_KBPS = -1
+        engine_off = make_engine()
+        calls_off = _install_fake_transfer(engine_off, line_kbps=7142, baseline_kbps=[3400])
+        off = _probe_once(engine_off, "http://10.11.0.6:8080")
+        check("UPLINK_BASELINE_KBPS<0  =>  关闭截断（读数原样）", off.up_kbps == 7142, off.up_kbps)
+        check("关闭截断时不测基线", calls_off["direct"] == 0, calls_off["direct"])
+        check("关闭截断不算 baseline_unavailable",
+              "baseline_unavailable" not in off.checks_detail.get("uplink", {}),
+              off.checks_detail.get("uplink"))
+
+        # 11.7 截断不改变门禁方向（基线远高于 85KB/s 门槛）
+        clamped = engine._summarize(2, ZAI, [_gate_round(3430), _gate_round(3430)])
+        raw = engine._summarize(2, ZAI, [_gate_round(7142), _gate_round(7142)])
+        check("被截断的线路仍然 >= 门槛、仍然 usable",
+              clamped.detail["gates"].get("uplink") is True and clamped.valid is True,
+              clamped.detail.get("gates"))
+        check("截断与不截断的门禁结论一致", clamped.valid == raw.valid,
+              (clamped.valid, raw.valid))
+
+        # 11.8 同步路径同语义
+        proxy_check.UPLINK_BASELINE_KBPS = 0
+        engine_sync = make_engine()
+        calls_sync = _install_fake_transfer(engine_sync, line_kbps=7142,
+                                            baseline_kbps=[3400, 3430, 3460], sync=True)
+        sync_result = RoundResult(service_reachable=True)
+        engine_sync._probe_uplink_sync(sync_result, ZAI, {"https": "http://10.11.0.7:8080"})
+        check("同步路径同样截断到基线 3430", sync_result.up_kbps == 3430, sync_result.up_kbps)
+        check("同步路径同样标 saturated",
+              sync_result.checks_detail["uplink"].get("saturated") is True,
+              sync_result.checks_detail.get("uplink"))
+        check("同步路径的基线也用同一套仪器（3 次直连）",
+              calls_sync["direct"] == 3, calls_sync["direct"])
+
+        # 11.9 基线单次预算被封顶：3 次基线不会把首条线路的硬超时顶爆
+        capped = make_engine(uplink_budget=40)
+        check("基线单次预算封顶 20s（40s 预算时不超时）",
+              capped._baseline_transfer_budget() == 20, capped._baseline_transfer_budget())
+        tight = make_engine(uplink_budget=8)
+        check("基线预算不超过档位自己的 uplink_budget",
+              tight._baseline_transfer_budget() == 8, tight._baseline_transfer_budget())
+    finally:
+        (proxy_check.UPLINK_BASELINE_KBPS, proxy_check.UPLINK_BASELINE_RUNS,
+         proxy_check.UPLINK_BASELINE_STABILITY) = original
+
+
+# ── 12. 先连通、再测速（成本闸门 required_probes）──────────────────────────
+def test_precheck_cost_gate() -> None:
+    section("12. 先连通再测速：成本闸门（含 required_probes）")
+    order: List[str] = []
+
+    def build_stubs(order_list: List[str], aux_ok: bool):
+        async def service(session, result, profile, proxy, timeout, stop_event=None):
+            order_list.append("service")
+            result.service_reachable = True
+            result.status_code = 200
+            result.cf_bypass = True
+            result.valid = True
+            return True
+
+        async def aux(session, result, profile, proxy, timeout, stop_event=None):
+            order_list.append("aux:start")
+            await asyncio.sleep(0.05)
+            result.aux["zcode"] = aux_ok
+            order_list.append("aux:end")
+
+        async def api(session, result, profile, proxy, timeout):
+            order_list.append("api:start")
+            result.api_reachable = True
+
+        async def ip(session, result, proxy):
+            order_list.append("ip:start")
+            result.ip = "1.2.3.4"
+
+        return service, aux, api, ip
+
+    def run_case(profile, aux_ok: bool):
+        engine = make_engine()
+        fake = FakeSession()
+        order.clear()
+        service, aux, api, ip = build_stubs(order, aux_ok)
+        engine._probe_service_async = service  # type: ignore[method-assign]
+        engine._probe_aux_async = aux  # type: ignore[method-assign]
+        engine._probe_api_async = api  # type: ignore[method-assign]
+        engine._probe_ip_async = ip  # type: ignore[method-assign]
+
+        async def go():
+            return await engine.check_once_async("http://10.12.0.1:8080", profile, fake, None, 5)
+
+        return asyncio.run(go()), fake.calls, list(order)
+
+    # 12.1 zcode 门禁不通过 → 一个字节都不发
+    res_fail, calls_fail, _ = run_case(ZAI, False)
+    check("zcode 门禁不通过 → 一个字节都不发", calls_fail == 0, calls_fail)
+    check("门禁不通过 → reason=aux_gate_failed 且标 skipped",
+          res_fail.checks_detail.get("uplink", {}).get("reason") == "aux_gate_failed"
+          and res_fail.checks_detail["uplink"].get("skipped") is True,
+          res_fail.checks_detail.get("uplink"))
+    check("门禁不通过 → up_kbps 为 None 且 up_error 说明原因",
+          res_fail.up_kbps is None and res_fail.up_error == "aux_gate_failed",
+          (res_fail.up_kbps, res_fail.up_error))
+
+    # 12.2 门禁通过 → 正常测速
+    res_ok, calls_ok, order_ok = run_case(ZAI, True)
+    check("zcode 门禁通过 → 正常测速（搬一次 body）", calls_ok == 1 and res_ok.up_kbps is not None,
+          (calls_ok, res_ok.up_kbps, res_ok.up_error))
+
+    # 12.3 zai 档：aux 先跑完、再启动 api -- 证明 aux 已从并行批里提出来
+    check("zai 档：aux 跑完才启动 api（aux 已从并行批里提出）",
+          order_ok.index("aux:end") < order_ok.index("api:start"), order_ok)
+
+    # 12.4 关闭测速的档位：aux 仍在并行批里，次序与改造前一致
+    zai_parallel = dataclasses.replace(ZAI, uplink_probe=False)
+    res_par, calls_par, order_par = run_case(zai_parallel, True)
+    check("关闭测速的档位：aux 仍在并行批里（api 先于 aux 结束）",
+          order_par.index("api:start") < order_par.index("aux:end"), order_par)
+    check("关闭测速的档位：不写 uplink 明细", "uplink" not in res_par.checks_detail,
+          sorted(res_par.checks_detail))
+    check("关闭测速的档位：不搬 body", calls_par == 0, calls_par)
+
+    # 12.5 没有 required_probes 的测速档位 → 只看 service_reachable
+    async def run_no_required():
+        engine = make_engine()
+        fake = FakeSession()
+
+        async def service(session, result, profile, proxy, timeout, stop_event=None):
+            result.service_reachable = True
+            result.status_code = 200
+            result.cf_bypass = True
+            result.valid = True
+            return True
+
+        async def api(session, result, profile, proxy, timeout):
+            result.api_reachable = True
+
+        engine._probe_service_async = service  # type: ignore[method-assign]
+        engine._probe_api_async = api  # type: ignore[method-assign]
+        profile = dataclasses.replace(TARGET_PROFILES["claude"], uplink_probe=True)
+        result = await engine.check_once_async("http://10.12.0.2:8080", profile, fake, None, 5, "1.2.3.4")
+        return result, fake.calls
+
+    res_nr, calls_nr = asyncio.run(run_no_required())
+    check("没有 required_probes 的测速档位：只看 service_reachable 就测速",
+          calls_nr == 1 and res_nr.up_kbps is not None, (calls_nr, res_nr.up_kbps, res_nr.up_error))
+
+    # 12.6 同步路径同语义
+    engine_sync = make_engine()
+    uplink_calls = {"n": 0}
+
+    def service_sync(result, profile, proxy, timeout, stop_event=None):
+        result.service_reachable = True
+        return True
+
+    def aux_fail_sync(result, profile, proxy, timeout, stop_event=None):
+        result.aux["zcode"] = False
+
+    def aux_ok_sync(result, profile, proxy, timeout, stop_event=None):
+        result.aux["zcode"] = True
+
+    def api_sync(result, profile, proxy, timeout):
+        result.api_reachable = True
+
+    def ip_info_sync(result):
+        result.ip = "1.2.3.4"
+
+    def uplink_sync(result, profile, proxy, hint=None, stop_event=None):
+        uplink_calls["n"] += 1
+        result.up_kbps = 500
+
+    engine_sync._probe_service = service_sync  # type: ignore[method-assign]
+    engine_sync._probe_api = api_sync  # type: ignore[method-assign]
+    engine_sync._probe_ip_info = ip_info_sync  # type: ignore[method-assign]
+    engine_sync._probe_uplink_sync = uplink_sync  # type: ignore[method-assign]
+
+    engine_sync._probe_aux = aux_fail_sync  # type: ignore[method-assign]
+    sync_fail = engine_sync.check_once("http://10.12.0.3:8080", ZAI, None, 5, "1.2.3.4")
+    check("同步路径：门禁不通过 → 不测速且记 aux_gate_failed",
+          uplink_calls["n"] == 0
+          and sync_fail.checks_detail.get("uplink", {}).get("reason") == "aux_gate_failed",
+          (uplink_calls["n"], sync_fail.checks_detail.get("uplink")))
+
+    engine_sync._probe_aux = aux_ok_sync  # type: ignore[method-assign]
+    sync_ok = engine_sync.check_once("http://10.12.0.4:8080", ZAI, None, 5, "1.2.3.4")
+    check("同步路径：门禁通过 → 正常测速",
+          uplink_calls["n"] == 1 and sync_ok.up_kbps == 500,
+          (uplink_calls["n"], sync_ok.up_kbps))
+
+
 def main() -> None:
     print("上行吞吐（up_kbps）自检开始")
     print(f"  UPLINK_PROBE={os.environ.get('UPLINK_PROBE')}  "
@@ -969,6 +1322,8 @@ def main() -> None:
     test_direction()
     test_budget_truncation()
     test_concurrency_gate()
+    test_baseline_saturation()
+    test_precheck_cost_gate()
 
     total = len(PASSED) + len(FAILED)
     print(f"\n结果: {len(PASSED)}/{total} 通过，跳过 {len(SKIPPED)} 项")
