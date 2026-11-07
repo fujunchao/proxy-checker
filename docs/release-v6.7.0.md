@@ -52,4 +52,21 @@
 
 **已知限制**（下一版再改）：点值精度受「前 1–2MB 被内核缓冲吸收」影响，快线之间拉不开差距（读数在 ~700KB/s–7MB/s 之间抖动）；若要把点值噪声压到 2× 以内，需要更大载荷或改成「用末尾窗口估算」的稳健估计量，代价是流量成倍。**因此门槛建议按方案 §8 先用 `up_min=50` 观察一周，再收紧到 85。**
 
-具体范围见 [实施方案](implementation-plan-v6.7.0.md)。真实首字延迟收益需要下游按 `up_kbps` 改派之后才能对照观测，不以合成测试冒充线上实测。
+具体范围见 [实施方案](implementation-plan-v6.7.0.md)。
+
+## 发布验证记录
+
+- 源码提交：[`14fd57b`](https://github.com/fujunchao/proxy-checker/commit/14fd57bdefc4b3f76417c38a3db1e593d270b92b)（工作分支 `codex/v6.7.0-uplink` 合并到 main）。
+- [工作分支完整 CI](https://github.com/fujunchao/proxy-checker/actions/runs/42324354223)：通过（后端、前端、完整冒烟 + Docker fixed/isolated）。
+- [main 同 SHA 完整 CI](https://github.com/fujunchao/proxy-checker/actions/runs/42324615817)：通过。
+- [标签完整测试与双架构构建](https://github.com/fujunchao/proxy-checker/actions/runs/42324858605)：通过。
+- 镜像核对：`ghcr.io/fujunchao/proxy-checker:v6.7.0` 与 `latest` 同摘要
+  `sha256:4b4db4ccadfcb9217f92a60b29a9cb51411a85e04f7150329f3b4be1ebf7e382`，
+  含 `linux/amd64`（`sha256:037b5302…`）与 `linux/arm64`（`sha256:228b21f2…`），
+  两者 `org.opencontainers.image.revision` 均为 `14fd57b`。
+- 期间修过一次 CI 红：新增的测速回归在 GitHub runner 上因内核缓冲把 2MiB 整段吸收，
+  本地限速代理失去「已知真值」的前提（读数 8178KB/s / 真值 200KB/s、预算截断用例根本发不满 2MiB），
+  首轮 run `42323928463` 因此失败。修法是「先验证仪器再断言」：代理侧收小接收缓冲，
+  并在构造不出稳态时跳过依赖前提的断言（而不是把物理事实判成实现缺陷）。
+- 本版仍是**只发布、不部署**：线上容器未重启、未改动任何用户配置与数据。
+真实首字延迟收益需要下游按 `up_kbps` 改派之后才能对照观测，不以合成测试冒充线上实测。
