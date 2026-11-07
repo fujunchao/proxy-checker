@@ -53,7 +53,7 @@ jobs:
       - name: 语法与前端回归
         run: |
           mkdir -p artifacts
-          python -m py_compile server.py proxy_check.py repository.py maintenance.py tools/test_maintenance_pipeline.py tools/test_workspace.py tools/smoke.py
+          python -m py_compile server.py proxy_check.py repository.py maintenance.py tools/test_maintenance_pipeline.py tools/test_workspace.py tools/smoke.py tools/test_uplink.py
           node --check app.js
           node tools/test_workspace_frontend.js 2>&1 | tee artifacts/frontend.log
           node tools/test_result_performance.js 2>&1 | tee artifacts/result-performance.log
@@ -68,6 +68,8 @@ jobs:
           python tools/test_maintenance_api.py 2>&1 | tee artifacts/maintenance-api.log
           python tools/test_repo_policy.py 2>&1 | tee artifacts/repo-policy.log
           python tools/test_zai_profile.py 2>&1 | tee artifacts/zai-profile.log
+      - name: 上行吞吐测速回归
+        run: python tools/test_uplink.py 2>&1 | tee artifacts/uplink.log
       - name: 固定身份、重启持久化及两种模式完整冒烟
         run: python tools/test_workspace.py 2>&1 | tee artifacts/workspace.log
       - name: 保存测试日志

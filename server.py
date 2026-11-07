@@ -24,7 +24,18 @@ try:
 except ImportError:
     ZoneInfo = None
 
-from proxy_check import CheckConfig, DEFAULT_TARGET_CHAT, ProxyCheckEngine, TARGET_PROFILE_OPTIONS
+from proxy_check import (
+    CheckConfig,
+    DEFAULT_TARGET_CHAT,
+    ProxyCheckEngine,
+    TARGET_PROFILE_OPTIONS,
+    # 上行测速的默认值只维护一份（定义在 proxy_check 里），这里 import 同名常量当配置兜底，
+    # 免得 server 和引擎各写一套默认值、改一处忘另一处。
+    UPLINK_BUDGET,
+    UPLINK_MIN_BYTES,
+    UPLINK_MIN_KBPS,
+    UPLINK_PROBE_ENABLED,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 容器化部署时可用 CONFIG_LOCAL_PATH 把运行期配置指向挂载卷；不设置则保持原有行为（源码目录旁）。
@@ -58,6 +69,22 @@ def get_config_int(key, env_name, default):
         return int(get_config_value(key, env_name, default))
     except (TypeError, ValueError):
         return default
+
+
+def get_config_bool(key, env_name, default):
+    """布尔配置读取：config.json 写 true/false，.env 写 1/0/true/false 都认。
+
+    解析不出来时回落到 default，不抛异常——配置写错不该让服务起不来。
+    """
+    value = get_config_value(key, env_name, default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return bool(default)
 
 # ============================================================
 # My Repository — save/retrieve repo proxies as txt
@@ -161,12 +188,24 @@ RUN_LOG_LIMIT = max(20, min(1000, RUN_LOG_LIMIT))
 if APP_TIMEZONE not in TIMEZONE_IDS:
     APP_TIMEZONE = "UTC"
 
+# 上行吞吐测速（up_kbps）的部署级配置。键名与 config.json 对齐，留空时一律取
+# proxy_check 里的同名常量当默认值（两处默认值只有一份来源）。
+# 不新增网页设置项：这几项是运维级开关，改了需要重启，与 UPLINK_PROBE 的总开关语义一致。
+UPLINK_PROBE_CFG = get_config_bool("uplink_probe", "UPLINK_PROBE", UPLINK_PROBE_ENABLED)
+UPLINK_MIN_KBPS_CFG = get_config_int("uplink_min_kbps", "UPLINK_MIN_KBPS", UPLINK_MIN_KBPS)
+UPLINK_BUDGET_CFG = get_config_int("uplink_budget", "UPLINK_BUDGET", UPLINK_BUDGET)
+UPLINK_MIN_BYTES_CFG = get_config_int("uplink_min_bytes", "UPLINK_MIN_BYTES", UPLINK_MIN_BYTES)
+
 TARGET_CHAT = DEFAULT_TARGET_CHAT
 check_engine = ProxyCheckEngine(
     CheckConfig(
         timeout=TIMEOUT,
         detect_timeout=DETECT_TIMEOUT,
         check_rounds=CHECK_ROUNDS,
+        uplink_probe=UPLINK_PROBE_CFG,
+        uplink_min_kbps=UPLINK_MIN_KBPS_CFG,
+        uplink_budget=UPLINK_BUDGET_CFG,
+        uplink_min_bytes=UPLINK_MIN_BYTES_CFG,
     )
 )
 
@@ -213,7 +252,8 @@ TARGET_PROFILE_IDS = {str(item["id"]) for item in TARGET_PROFILE_OPTIONS}
 # （result.usable，由档位的 required_probes 门禁给出）。集中定义避免多处白名单漂移。
 REPO_UPDATE_POLICIES = ("stable_only", "include_unstable", "archive_all", "target_only")
 # 订阅导出（/api/repo/<token>.txt|json）支持的可选过滤参数。不带任何参数时行为与从前完全一致。
-EXPORT_PARAMS = ("grade", "usable", "stable", "proto", "comment", "limit", "exclude_socks4", "exclude_shared_ip")
+EXPORT_PARAMS = ("grade", "usable", "stable", "proto", "comment", "limit", "exclude_socks4", "exclude_shared_ip",
+                 "up_min")
 # 连续通过多少轮复测才算「稳定」。免费代理单轮通过说明不了什么，寿命以分钟计。
 STABLE_PASS_STREAK = 2
 EXPORT_PROTOCOLS = ("http", "https", "socks4", "socks5", "socks5h")
@@ -393,7 +433,10 @@ def compact_repo_item(item):
     now = int(time.time() * 1000)
     compact = {"proxy": proxy, "grade": str(item.get("grade") or "?")}
     for key in ("latency", "ip", "country", "ip_type", "recommended_use", "target_profile", "target_name",
-                "usable", "usable_reason", "protocol_note", "last_ok", "last_checked_at"):
+                "usable", "usable_reason", "protocol_note", "last_ok", "last_checked_at",
+                # 上行吞吐读数（KB/s）与测速失败原因：这是判定之外的原始读数，
+                # 订阅导出排序、?up_min 过滤都依赖它，丢了就等于没测。
+                "up_kbps", "up_error"):
         value = item.get(key)
         if value is not None and value != "":
             compact[key] = value
@@ -514,6 +557,18 @@ def repo_export_filtered(params):
     return any(key in params for key in EXPORT_PARAMS)
 
 
+def up_kbps_of(item):
+    """读取仓库条目的实测上行（KB/s）。
+
+    缺字段/空值/脏值一律当 0：**「没测过」不能当成「快」**。本维度上线前入库的旧条目没有
+    这个字段，若按缺省放行，?up_min=85 会把一批没测过（多半是慢线）的记录原样导出去。
+    """
+    try:
+        return int(item.get("up_kbps") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
 def filter_repo_for_export(repo, params):
     """按订阅链接的查询参数过滤仓库条目。
 
@@ -536,6 +591,13 @@ def filter_repo_for_export(repo, params):
         items = [item for item in items if proto_of(item.get("proxy")) != "socks4"]
     if truthy_param((params.get("exclude_shared_ip") or [""])[0]):
         items = [item for item in items if item.get("ip_shared") is not True]
+    # 上行带宽过滤：?up_min=85 只导出实测上行 >=85KB/s 的线路。
+    # 位置很关键——必须排在 limit 之前：带 limit 的订阅链接应当「先缩小集合再截断」，
+    # 反过来会出现「截断后剩下的恰好都不达标 → 导出空」的抖动。
+    up_min_text = str((params.get("up_min") or [""])[0]).strip()
+    if up_min_text.isdigit() and int(up_min_text) > 0:
+        threshold = int(up_min_text)
+        items = [item for item in items if up_kbps_of(item) >= threshold]
     limit_text = str((params.get("limit") or [""])[0]).strip()
     if limit_text.isdigit() and int(limit_text) > 0:
         items = items[:int(limit_text)]
@@ -552,7 +614,7 @@ def render_repo_txt(items, comment=False):
         if comment:
             meta = " ".join(
                 f"{key}={item[key]}"
-                for key in ("grade", "ip", "country", "ip_type", "latency", "pass_streak")
+                for key in ("grade", "ip", "country", "ip_type", "latency", "up_kbps", "pass_streak")
                 if item.get(key) not in (None, "")
             )
             if meta:
@@ -923,6 +985,11 @@ def apply_runtime_settings(settings):
             timeout=TIMEOUT,
             detect_timeout=DETECT_TIMEOUT,
             check_rounds=CHECK_ROUNDS,
+            # 上行测速三项随引擎重建一起传：改了检测超时不能把测速配置弄丢。
+            uplink_probe=UPLINK_PROBE_CFG,
+            uplink_min_kbps=UPLINK_MIN_KBPS_CFG,
+            uplink_budget=UPLINK_BUDGET_CFG,
+            uplink_min_bytes=UPLINK_MIN_BYTES_CFG,
         )
     )
     return password_changed
@@ -1195,6 +1262,9 @@ def result_to_repo_item(result, existing=None):
     else:
         streak = 0
         fail_count += 1
+    # 沿用旧读数的判定放在这里显式写出来（而不是塞进字典字面量里），
+    # 免得后来者以为 "up_kbps": result.get(...) 的 None 是笔误又给「修」回去。
+    up_kbps = result.get("up_kbps") if result.get("up_kbps") is not None else existing.get("up_kbps")
     item = {
         "proxy": result.get("proxy") or result.get("original"),
         "grade": result.get("grade") or "F",
@@ -1211,6 +1281,15 @@ def result_to_repo_item(result, existing=None):
         "pass_streak": streak,
         "fail_count": fail_count,
         "last_ok": now if ok else existing.get("last_ok"),
+        # 上行读数的落库口径：
+        # - 有读数就覆盖（带宽会漂移，新测量更可信）；
+        # - 本轮没读数（测速端点挂了 / 成本闸门跳过 / UPLINK_PROBE=0）则沿用旧读数：
+        #   「测不到」≠「这条线变慢了」，旧读数在新测量出现前继续代表这条线，
+        #   否则一次端点故障就会把整仓读数抹掉、让 ?up_min 订阅瞬间变空（与 D4 同一取舍）。
+        # - 绝不把 None 改写成 0：把「没测到」伪装成「0KB/s」会让过滤误杀线路。
+        "up_kbps": up_kbps,
+        # up_error 仍按**本轮**结果写：它解释「为什么这条读数是历史值」，可以和 up_kbps 并存。
+        "up_error": result.get("up_error") or None,
         "cf_bypass": result.get("cf_bypass") is True,
         "recommended_use": result.get("recommended_use"),
         "target_profile": result.get("target_profile"),

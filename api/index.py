@@ -15,7 +15,17 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from proxy_check import CheckConfig, ProxyCheckEngine, TARGET_PROFILE_OPTIONS
+from proxy_check import (
+    CheckConfig,
+    ProxyCheckEngine,
+    TARGET_PROFILE_OPTIONS,
+    # 上行测速默认值只维护一份（在 proxy_check 里），这里 import 同名常量当配置兜底，
+    # 与 server.py 保持完全一致的默认值来源。
+    UPLINK_BUDGET,
+    UPLINK_MIN_BYTES,
+    UPLINK_MIN_KBPS,
+    UPLINK_PROBE_ENABLED,
+)
 
 app = Flask(__name__, static_folder=None)
 
@@ -56,6 +66,22 @@ def get_config_int(key, env_name, default):
     except (TypeError, ValueError):
         return default
 
+
+def get_config_bool(key, env_name, default):
+    """布尔配置读取：config.json 写 true/false，.env 写 1/0/true/false 都认。
+
+    解析不出来时回落到 default，不抛异常——配置写错不该让函数实例起不来。
+    """
+    value = get_config_value(key, env_name, default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return bool(default)
+
 # ============================================================
 # Configuration
 # ============================================================
@@ -82,11 +108,22 @@ AUTH_COOKIE_NAME = "proxy_checker_auth"
 AUTH_SESSION_SECONDS = max(1, AUTH_SESSION_DAYS) * 86400
 AUTH_SESSION_SECRET = str(get_config_value("auth_session_secret", "AUTH_SESSION_SECRET", AUTH_PASSWORD))
 
+# 上行吞吐测速（up_kbps）的部署级配置，键名与 config.json 对齐；默认值取 proxy_check 的
+# 同名常量，避免 server.py 与 Vercel 版出现两套默认值。
+UPLINK_PROBE_CFG = get_config_bool("uplink_probe", "UPLINK_PROBE", UPLINK_PROBE_ENABLED)
+UPLINK_MIN_KBPS_CFG = get_config_int("uplink_min_kbps", "UPLINK_MIN_KBPS", UPLINK_MIN_KBPS)
+UPLINK_BUDGET_CFG = get_config_int("uplink_budget", "UPLINK_BUDGET", UPLINK_BUDGET)
+UPLINK_MIN_BYTES_CFG = get_config_int("uplink_min_bytes", "UPLINK_MIN_BYTES", UPLINK_MIN_BYTES)
+
 check_engine = ProxyCheckEngine(
     CheckConfig(
         timeout=TIMEOUT,
         detect_timeout=DETECT_TIMEOUT,
         check_rounds=CHECK_ROUNDS,
+        uplink_probe=UPLINK_PROBE_CFG,
+        uplink_min_kbps=UPLINK_MIN_KBPS_CFG,
+        uplink_budget=UPLINK_BUDGET_CFG,
+        uplink_min_bytes=UPLINK_MIN_BYTES_CFG,
     )
 )
 

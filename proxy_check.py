@@ -7,7 +7,18 @@ import statistics
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import (
+    AsyncIterator,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 from curl_cffi import requests as cffi_requests
 
@@ -27,6 +38,61 @@ DEFAULT_ZAI_TARGET = "https://z.ai/"
 DEFAULT_ZAI_API = "https://api.z.ai/api/paas/v4/models"
 DEFAULT_IP_TARGETS = ("https://httpbin.org/ip", "https://api.ipify.org?format=json")
 DEFAULT_IP_INFO_TARGETS = ("https://ipinfo.io/{ip}/json", "https://ipwho.is/{ip}")
+
+
+def _env_int(name: str, default: int) -> int:
+    """读整数型环境变量：空串与非法值一律回退默认值。
+
+    刻意不在 import 期裸 int()：一个拼错的环境变量会让整个服务启动失败，
+    与「测速失败不得阻断既有判定」是同一个取舍。
+    """
+    raw = os.environ.get(name)
+    text = str(raw).strip() if raw is not None else ""
+    if not text:
+        return default
+    try:
+        return int(text)
+    except ValueError:
+        return default
+
+
+# ── 上行吞吐探测（up_kbps）─────────────────────────────────────────────────
+# 下游网关的请求体是 324KB（中位）的 JSON，必须**上行写入**代理线路；实测
+# firstbyte ≈ (body_KB ÷ up_kbps) × 1.45（r=0.975）。既有 latency 只测「几 KB 下行 + 一次 RTT」，
+# 对这个维度没有预测力——一条 RTT 40ms、上行 8KB/s 的线路在旧评分里是「优等生」。
+#
+# 测速端点必须独立于被测目标，且对端会「按线速读请求体」，才能量到链路本身而不是内核缓冲：
+# ⚠️ 绝不能换成 zcode.z.ai：它的 443 收到非 TLS 字节会在 10ms 内回 400 并重置连接，
+#    量到的是「内核缓冲容量 ÷ 对端关闭时间」，方向都不确定（实测高估 5.2×、也会低估 5.4×）。
+UPLINK_SPEED_URL = "https://speed.cloudflare.com/__up"
+# 载荷下限 2MiB：所有线路前 ~128KB 会瞬间写进内核缓冲（0.2–0.3s），之后才断崖跌到真实链路速率。
+# 512KB 会被缓冲完全掩盖（实测差 6.8×），1MiB 仍落在突发窗口内；324KB 的请求体恰好整段在断崖之后。
+UPLINK_MIN_BYTES = 2 * 1024 * 1024
+# 稳态统计起点：跳过前 128KB 的缓冲吸收段。
+UPLINK_SKIP_BYTES = 128 * 1024
+# 单块大小：64KiB 在「里程碑足够密」与「系统调用次数」之间折中。
+UPLINK_CHUNK_BYTES = 64 * 1024
+# 单次测速预算（秒）。慢线写不完 2MiB，靠已采样的里程碑读数 + 慢线提前收尾兜底。
+UPLINK_BUDGET = 40
+# 达标门槛（KB/s）：85 是下游 zcode2api-plus 的 DeepMinKbps 默认值，两边保持一致便于对账。
+# 324KB 请求体：85KB/s → 3.8s 上传；50KB/s → 6.5s；22KB/s（当前池子中位）→ 15s。
+UPLINK_MIN_KBPS = _env_int("UPLINK_MIN_KBPS", 85)
+# 上行测速总开关（环境变量级，兼回滚开关）：UPLINK_PROBE=0 一键退回「只看可达性」。
+UPLINK_PROBE_ENABLED = str(os.environ.get("UPLINK_PROBE", "1")).strip().lower() in ("1", "true", "yes", "on")
+# 复测节流：同一条线路在进程内 6h 内不重复烧流量（方案 §5「最简版」的落地）。0 = 关闭缓存。
+# 进程重启即丢失，可接受：免费代理本来就频繁换 IP:port，缓存只需覆盖「连续两轮巡检撞同一条线」。
+UPLINK_REPROBE_SECONDS = _env_int("UPLINK_REPROBE_SECONDS", 6 * 3600)
+# 慢线提前收尾：已写够 skip*2 且算出来明显低于门槛（<门槛/2）时不必耗满预算。
+UPLINK_SLOW_ABORT_SECONDS = 15
+# 并发闸：**同时最多几条线路在发测速**。注意这是「防宿主上行争用」，不是「防成本」：
+# 测速流量走的是宿主自己的上行出口，N 条并发时每条只能分到「宿主带宽 ÷ N」，
+# 快线会被系统性压到门槛附近（部署机直连上行 ~2570KB/s，并发 30 时 ≈85KB/s，正好卡在
+# 门槛线上 → 排序失真 + 临界线误杀，并发越高越严重）。0 或负数表示不限（回滚用）。
+UPLINK_PROBE_CONCURRENCY = _env_int("UPLINK_PROBE_CONCURRENCY", 2)
+# 等名额的最长时间（秒）。**有界获取**：拿不到就跳过这一轮，绝不做无界等待——
+# 维护批次有 120s 预算，让线路干等名额会把整轮拖到被批次预算砍掉；
+# 跳过只损失这一轮的读数，而 D4（measured==0 放行）保证它不会被误判成慢线。
+UPLINK_PROBE_WAIT_SECONDS = _env_int("UPLINK_PROBE_WAIT_SECONDS", 3)
 
 CF_BODY_INDICATORS = (
     "challenge-platform",
@@ -112,6 +178,8 @@ class TargetProfile:
     # 达标门槛：这里列出的 aux 探针必须「每轮都通过」，否则该线路不算 valid
     # （评级 grade 照常给出，供人工参考，但 valid/usable 会被门禁否掉）。
     required_probes: Tuple[str, ...] = ()
+    # 是否为本档跑上行测速。默认 False ⇒ 除 zai 档外，既有档位行为逐字不变。
+    uplink_probe: bool = False
 
 
 def zai_aux_probes() -> Tuple[AuxProbe, ...]:
@@ -191,6 +259,9 @@ TARGET_PROFILES: Dict[str, TargetProfile] = {
         # 门禁只卡 zcode：本档要回答的是「这条线路能不能给 ZCode 客户端出站用」，
         # api.z.ai 只是备援端点，差异交给 usable_reason 暴露，由使用者自行取舍。
         required_probes=("zcode",),
+        # 下游 zcode2api-plus 的请求体是 324KB 上行写入，latency（GET 网页的 RTT）
+        # 对这件事没有任何预测力。开上行测速是本档唯一能改善下游 TTFT 的信号。
+        uplink_probe=True,
     ),
 }
 
@@ -219,6 +290,13 @@ class CheckConfig:
     impersonate: str = "chrome"
     ip_info_cache_ttl: int = 3600
     default_target_profile: str = DEFAULT_TARGET_PROFILE
+    # 上行测速（方案 §4 的 config.json 键名保持一致，全部有默认值 ⇒ 老配置不用改）。
+    # 注意三个开关的分工：uplink_probe 是「部署级」，TargetProfile.uplink_probe 是「档位级」，
+    # UPLINK_PROBE_ENABLED 是「环境变量级总开关/回滚开关」。
+    uplink_probe: bool = True
+    uplink_min_kbps: int = UPLINK_MIN_KBPS
+    uplink_budget: int = UPLINK_BUDGET
+    uplink_min_bytes: int = UPLINK_MIN_BYTES
 
 
 @dataclass(frozen=True)
@@ -260,6 +338,12 @@ class RoundResult:
     cf_indicators: List[str] = field(default_factory=list)
     registration_ready: bool = False
     registration_detail: Optional[str] = None
+    # 上行吞吐（KB/s）：稳态速率，已跳过前 128KB 缓冲段。None = 未测 / 测速失败。
+    # 这是**独立于 latency 的第二个维度**：latency 测「通不通、建连快不快」，
+    # up_kbps 测「324KB 请求体要传多久」，两者不可互相替代。
+    up_kbps: Optional[int] = None
+    # 测速失败原因（"连接超时" / "insufficient_bytes" 等，由 classify_error 归一）；成功时为空。
+    up_error: Optional[str] = None
     checks_detail: Dict[str, object] = field(default_factory=dict)
 
     @classmethod
@@ -306,6 +390,18 @@ class ProxyCheckEngine:
     def __init__(self, config: CheckConfig):
         self.config = config
         self.ip_info_cache = IpInfoCache(config.ip_info_cache_ttl)
+        # 上行读数缓存：proxy → (过期时刻 monotonic, kbps)。风格与 IpInfoCache 一致，
+        # 但键是线路本身（免费代理频繁换 IP:port，换端口就是另一条线，正好天然失效）。
+        # 进程重启即丢失，可接受（见 UPLINK_REPROBE_SECONDS 的注释）。
+        self._uplink_cache: Dict[str, Tuple[float, int]] = {}
+        self._uplink_lock = threading.Lock()
+        # 并发闸（防宿主上行争用，见 UPLINK_PROBE_CONCURRENCY）。
+        # asyncio.Semaphore 会绑定首次使用它的事件循环，所以不能在这里建：
+        # 引擎可能在无事件循环的线程里构造（server.py 在模块级构造），测试也会反复 asyncio.run。
+        self._uplink_gate: Optional[asyncio.Semaphore] = None
+        self._uplink_gate_loop: Optional[asyncio.AbstractEventLoop] = None
+        # 同步路径没有事件循环，用线程侧的有界信号量（拿不到同样直接跳过）。
+        self._uplink_gate_sync: Optional[threading.BoundedSemaphore] = None
 
     async def check_many_async(
         self,
@@ -378,7 +474,420 @@ class ProxyCheckEngine:
         per_round = self.config.timeout * attempts + self.config.detect_timeout
         per_round += self.config.timeout * len(profile.aux_probes)
         expected_round_budget = rounds * per_round
-        return max(30, min(120, expected_round_budget + 10))
+        # 上行测速只跑首轮（D2），但硬超时必须把它算进来：40s 预算 + 收尾余量。
+        # 不算的话 zai 档 2 轮的原 98s 硬超时会在测速中途掐死合法检测（实测需要 ~118s）。
+        if self._uplink_active(profile):
+            expected_round_budget += max(0, int(self.config.uplink_budget))
+        return max(30, min(180, expected_round_budget + 10))
+
+    def _summarize(
+        self,
+        rounds: int,
+        profile: TargetProfile,
+        results: Sequence[RoundResult],
+    ) -> ScoreSummary:
+        """统一构造 ScoreAggregator，把本引擎的上行开关与门槛显式传进去。
+
+        不显式传的话，ScoreAggregator 只能按全局常量推导，config.json 里的
+        uplink_probe / uplink_min_kbps 就不生效了（两套默认值随后必然漂移）。
+        """
+        return ScoreAggregator(
+            rounds,
+            profile,
+            uplink_enabled=self._uplink_active(profile),
+            uplink_min_kbps=int(self.config.uplink_min_kbps),
+        ).summarize(results)
+
+    # ── 上行测速（up_kbps）──────────────────────────────────────────────────
+    def _uplink_active(self, profile: TargetProfile) -> bool:
+        """三级开关同时为真才测速（任一关闭即不测）。
+
+        分工与优先级：
+          1. UPLINK_PROBE 环境变量：总开关，也是**回滚开关**（方案 §8：设 UPLINK_PROBE=0 并重启）；
+          2. config.uplink_probe：部署级（config.json / 构造 CheckConfig 时传入）；
+          3. profile.uplink_probe：档位级，只有明确需要这个维度的档（zai）才开。
+        环境变量排第一：运维止血时不该被配置文件挡着。
+        """
+        return bool(UPLINK_PROBE_ENABLED and self.config.uplink_probe and profile.uplink_probe)
+
+    def _uplink_cache_get(self, proxy: str) -> Optional[int]:
+        """取进程内缓存的上行读数；TTL 过期或缓存关闭（UPLINK_REPROBE_SECONDS<=0）时返回 None。"""
+        ttl = int(UPLINK_REPROBE_SECONDS)
+        if ttl <= 0 or not proxy:
+            return None
+        now = time.monotonic()
+        with self._uplink_lock:
+            entry = self._uplink_cache.get(proxy)
+            if entry is None:
+                return None
+            expires_at, kbps = entry
+            if expires_at <= now:
+                del self._uplink_cache[proxy]
+                return None
+            return kbps
+
+    def _uplink_cache_set(self, proxy: str, kbps: int) -> None:
+        """写入上行读数缓存；只由「真正跑了测速」的路径调用（复用/缓存命中不回写，避免无限续期）。"""
+        ttl = int(UPLINK_REPROBE_SECONDS)
+        if ttl <= 0 or not proxy:
+            return
+        with self._uplink_lock:
+            self._uplink_cache[proxy] = (time.monotonic() + ttl, int(kbps))
+
+    # ── 上行测速的并发闸（防宿主上行争用，不是防成本）─────────────────────
+    def _uplink_gate_for_loop(self) -> Optional[asyncio.Semaphore]:
+        """取当前事件循环的并发闸；不启用（N<=0）时返回 None。
+
+        asyncio.Semaphore 一旦被 await 就会绑定当时的事件循环，跨 loop 复用会抛
+        "is bound to a different event loop"。因此按 loop 惰性创建：生产只有一条 loop，
+        测试里反复 asyncio.run 也能各自拿到干净的闸门。
+        """
+        limit = int(UPLINK_PROBE_CONCURRENCY)
+        if limit <= 0:
+            return None
+        loop = asyncio.get_running_loop()
+        gate = self._uplink_gate
+        if gate is None or self._uplink_gate_loop is not loop:
+            gate = asyncio.Semaphore(limit)
+            self._uplink_gate = gate
+            self._uplink_gate_loop = loop
+        return gate
+
+    async def _acquire_uplink_gate(
+        self,
+    ) -> Tuple[bool, Optional[asyncio.Semaphore]]:
+        """有界获取测速名额：拿到返回 (True, gate)，等不到返回 (False, None)。
+
+        为什么是「有界」而不是「一直等」：维护批次有 120s 预算，等名额会把线路拖到
+        被批次砍掉（整轮无结果）；跳过只损失这一轮的读数，D4 下 measured==0 放行。
+        """
+        gate = self._uplink_gate_for_loop()
+        if gate is None:
+            return True, None
+        wait = int(UPLINK_PROBE_WAIT_SECONDS)
+        if wait <= 0:
+            # 不等待：事件循环是单线程的，locked() 与 acquire() 之间没有 await，判定安全。
+            if gate.locked():
+                return False, None
+            await gate.acquire()
+            return True, gate
+        try:
+            await asyncio.wait_for(gate.acquire(), timeout=wait)
+        except asyncio.TimeoutError:
+            return False, None
+        return True, gate
+
+    def _uplink_gate_for_thread(self) -> Optional[threading.BoundedSemaphore]:
+        """同步路径的并发闸（惰性创建）。
+
+        用 BoundedSemaphore 而不是 Lock：Lock 只能表达「最多 1 条」，
+        和异步侧的 UPLINK_PROBE_CONCURRENCY 不是同一个语义。
+        """
+        limit = int(UPLINK_PROBE_CONCURRENCY)
+        if limit <= 0:
+            return None
+        gate = self._uplink_gate_sync
+        if gate is None:
+            gate = threading.BoundedSemaphore(limit)
+            self._uplink_gate_sync = gate
+        return gate
+
+    def _mark_uplink_busy(self, result: RoundResult) -> None:
+        """没拿到测速名额：这一轮就不测了（不发流量、不写缓存、不记读数）。"""
+        result.up_kbps = None
+        result.up_error = "busy"
+        result.checks_detail["uplink"] = {
+            "target": UPLINK_SPEED_URL,
+            "error": "busy",
+            "skipped": True,
+            "concurrency": int(UPLINK_PROBE_CONCURRENCY),
+            "wait_seconds": int(UPLINK_PROBE_WAIT_SECONDS),
+        }
+
+    @staticmethod
+    def _uplink_rate(
+        marks: Sequence[Tuple[int, float]],
+        skip_bytes: int,
+        min_bytes: int,
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """由逐块里程碑算稳态上行速率（KB/s）。纯函数，便于单测。
+
+        区间固定为「首个 ≥skip_bytes 的里程碑 → 末里程碑」，**绝不用整体字节数/整体时间**：
+        前 ~128KB 会瞬间写进内核缓冲（0.2–0.3s），整体计时量到的是「缓冲容量 ÷ 总时间」，
+        对慢线严重高估（方案 §1② 的实测：512KB 载荷差 6.8×）。
+
+        关于「载荷必须 ≥2MiB」：本实现的语义是「**最多发** min_bytes（默认 2MiB），
+        实际能发多少取决于预算与线路速度；稳态区间只取 128KiB→末里程碑」。
+        慢线在 40s 预算内发不满 2MiB 也没关系——只要稳态区间有效，读数就有效（这正是
+        退化版「4MiB 整体计时」做不到的事：12KB/s 的线要 350s，测不出慢线，而慢线恰恰要筛掉）。
+
+        返回 (kbps, error)：
+          - written < skip_bytes*2 → (None, "insufficient_bytes")，样本太少不足以跳过缓冲段；
+          - 没有 ≥skip_bytes 的里程碑 / 区间非正 → (None, "insufficient_samples")；
+          - 否则 kbps = (end_bytes - base_bytes) / (end_ms - base_ms)，bytes/ms 恰好等于 KB/s。
+        """
+        if not marks:
+            return None, "insufficient_bytes"
+        written = marks[-1][0]
+        # skip*2 是「至少有一段可比较的稳态区间」的经验下限（128KiB 缓冲段 + 同样长的稳态段）。
+        if written < skip_bytes * 2 or written < min(skip_bytes, min_bytes):
+            return None, "insufficient_bytes"
+        base = next(((w, t) for w, t in marks if w >= skip_bytes), None)
+        end = marks[-1]
+        if base is None or end[0] <= base[0] or end[1] <= base[1]:
+            return None, "insufficient_samples"
+        kbps = (end[0] - base[0]) / (end[1] - base[1])   # bytes/ms == KB/s
+        return max(0, int(round(kbps))), None
+
+    def _finalize_uplink(
+        self,
+        result: RoundResult,
+        marks: Sequence[Tuple[int, float]],
+        status: Optional[int],
+        error: Optional[str],
+        elapsed_ms: float,
+        cache_key: str,
+    ) -> None:
+        """把一次测速的采样收敛成结果（同步/异步共用）。
+
+        失败绝不抛异常（D6）：只要能算出读数就记读数（中断/超预算的情况标 truncated），
+        算不出才把原因写进 up_error，让上层照常按既有判据评级（方案 §8「失败时不阻断既有判定」）。
+        """
+        need = max(UPLINK_CHUNK_BYTES, int(self.config.uplink_min_bytes))
+        skip = UPLINK_SKIP_BYTES
+        min_kbps = int(self.config.uplink_min_kbps)
+        written = marks[-1][0] if marks else 0
+        detail: Dict[str, object] = {
+            "target": UPLINK_SPEED_URL,
+            "written": written,
+            "skip_bytes": skip,
+            "min_kbps": min_kbps,
+            "source": "probe",
+            "elapsed_ms": round(elapsed_ms, 1),
+            "truncated": written < need,
+        }
+        if status is not None:
+            detail["status"] = status
+        if error is not None:
+            detail["error"] = error
+        kbps, rate_error = self._uplink_rate(marks, skip, need)
+        if kbps is None:
+            result.up_kbps = None
+            # 有异常原因时优先报异常（「连接超时」比「样本不足」有用得多）。
+            result.up_error = error or rate_error or "unknown"
+            detail["reason"] = result.up_error
+            result.checks_detail["uplink"] = detail
+            return
+        result.up_kbps = kbps
+        # 有读数就算成功：中断/超预算时详细原因留在 checks_detail["uplink"]["error"]，
+        # 不污染 up_error（否则订阅侧会同时看到「有读数 + 有错误」而不知所措）。
+        result.up_error = None
+        detail["kbps"] = kbps
+        detail["span_ms"] = round(marks[-1][1] - next(t for w, t in marks if w >= skip), 1)
+        result.checks_detail["uplink"] = detail
+        # 只有真正跑了测速才回写缓存；缓存/复用命中不再续期（避免一份旧读数被无限续命）。
+        self._uplink_cache_set(cache_key, kbps)
+
+    def _apply_uplink_hint(self, result: RoundResult, kbps: int, source: str) -> None:
+        """复用已有读数（首轮结果 / 进程内缓存），不再发流量。"""
+        result.up_kbps = int(kbps)
+        result.up_error = None
+        result.checks_detail["uplink"] = {
+            "target": UPLINK_SPEED_URL,
+            "kbps": int(kbps),
+            "min_kbps": int(self.config.uplink_min_kbps),
+            "source": source,
+        }
+
+    def _probe_uplink_sync(
+        self,
+        result: RoundResult,
+        profile: TargetProfile,
+        proxy: Mapping[str, str],
+        hint: Optional[int] = None,
+        stop_event: Optional[StopEvent] = None,
+    ) -> None:
+        """上行测速（同步路径 check_once 用）：与异步版同一套采样与计算逻辑。
+
+        为何用 content=<generator> 而不是 data=：curl_cffi 只接受
+        dict/list/tuple/str/BytesIO/bytes 作为 data，生成器会 TypeError。
+        同步读取器（_IterableReader）会把 Iterable[bytes] 转成 libcurl 的 read 回调，
+        因此每 yield 一块都要等 libcurl 取走上一块 ⇒ 里程碑时刻≈真实写速时刻。
+        预算兜底靠 libcurl 的 timeout（CURLOPT_TIMEOUT 覆盖上传阶段）：超时抛异常，
+        我们照样用已采集的 marks 算读数。
+
+        并发闸与异步版同义（防宿主上行争用，不是防成本）：同步路径没有事件循环，
+        用线程侧 BoundedSemaphore 做**非阻塞**获取——拿不到就直接跳过这一轮。
+        """
+        if not self._uplink_active(profile) or _is_stopped(stop_event):
+            return
+        cache_key = _proxy_key(proxy)
+        if hint is not None:
+            self._apply_uplink_hint(result, int(hint), "reuse")
+            return
+        cached = self._uplink_cache_get(cache_key)
+        if cached is not None:
+            self._apply_uplink_hint(result, cached, "cache")
+            return
+
+        # 并发闸：只在「真要发测速」的分支拿名额（hint 复用/缓存命中在上面已返回，不占名额）。
+        gate = self._uplink_gate_for_thread()
+        if gate is not None and not gate.acquire(blocking=False):
+            # 同步路径不等待（没有事件循环，等也只是空转）：拿不到就跳过这一轮。
+            self._mark_uplink_busy(result)
+            return
+        try:
+            marks: List[Tuple[int, float]] = []
+            started = time.monotonic()
+            budget = max(1, int(self.config.uplink_budget))
+            need = max(UPLINK_CHUNK_BYTES, int(self.config.uplink_min_bytes))
+            min_kbps = int(self.config.uplink_min_kbps)
+
+            def body() -> "Iterator[bytes]":
+                sent = 0
+                chunk = b"x" * UPLINK_CHUNK_BYTES
+                while sent < need:
+                    yield chunk
+                    sent += UPLINK_CHUNK_BYTES
+                    marks.append((sent, (time.monotonic() - started) * 1000.0))
+                    elapsed = time.monotonic() - started
+                    # 第一道闸：预算到点就收尾（生成器提前 return 会干净地结束 chunked 传输）。
+                    if elapsed >= budget:
+                        return
+                    # 明显慢线（<门槛/2）不必耗满预算：已经能判死，早点把连接让出来。
+                    if elapsed >= UPLINK_SLOW_ABORT_SECONDS and sent >= UPLINK_SKIP_BYTES * 2:
+                        kbps, _ = self._uplink_rate(marks, UPLINK_SKIP_BYTES, need)
+                        if kbps is not None and kbps < min_kbps / 2:
+                            return
+                    if _is_stopped(stop_event):
+                        return
+
+            status: Optional[int] = None
+            error: Optional[str] = None
+            try:
+                response = cffi_requests.post(
+                    UPLINK_SPEED_URL,
+                    proxies=dict(proxy),
+                    timeout=budget,
+                    impersonate=self.config.impersonate,
+                    headers={"Content-Type": "application/octet-stream"},
+                    content=body(),
+                    # 请求体是一次性生成器，不能重放；跟随跳转会在重发时抛 UnrewindableBodyError。
+                    allow_redirects=False,
+                )
+                status = int(getattr(response, "status_code", 0) or 0)
+            except Exception as exc:  # noqa: BLE001 —— 测速失败绝不向上抛（D6）
+                error = classify_error(str(exc))
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            self._finalize_uplink(result, marks, status, error, elapsed_ms, cache_key)
+        finally:
+            if gate is not None:
+                gate.release()
+
+    async def _probe_uplink_async(
+        self,
+        session: cffi_requests.AsyncSession,
+        result: RoundResult,
+        profile: TargetProfile,
+        proxy: Mapping[str, str],
+        stop_event: Optional[StopEvent] = None,
+        hint: Optional[int] = None,
+    ) -> None:
+        """上行测速（异步主路径）：逐块 yield 2MiB，按里程碑算稳态速率。
+
+        为什么不用方案 §2.5 主版本的 response.upload()：curl_cffi 0.16.3 **没有** upload 回调
+        （hasattr(r,"upload") is False，只有传输结束才有的 upload_size），主版本不可用。
+        为什么也不用方案 §7.1 的退化版（4MiB 整体计时）：12KB/s 的慢线要 350s，远超 40s 预算，
+        而慢线恰恰是要被筛掉的那批。里程碑版两头都能测（详见 _uplink_rate 的 docstring）。
+
+        实测依据（work/uplink-probe/probe1.py）：
+          - content=<async generator> 可用，curl_cffi 内部是 asyncio.Queue(maxsize=1) 交接，
+            每块都要等 libcurl 取走上一块 ⇒ 里程碑时刻≈真实写速时刻；
+          - data=<generator> 会 TypeError，必须用 content=；
+          - 生成器提前 return 能干净收尾（chunked 结束，拿到 200）。
+
+        预算兜底（两道闸，缺一不可）：
+          1. 生成器内部检查 elapsed/budget 并 return；
+          2. **外层 asyncio.wait_for(budget+2)**：libcurl 的读取节奏可能让生成器长时间回不到
+             检查点（实测 12KB/s 线路上「elapsed>budget 就 return」在 40s 没生效，整段跑了 101.8s），
+             所以必须有外层硬闸；超时取消后**用已采集的 marks 算读数**——那正是慢线最需要的读数。
+
+        **并发闸**（UPLINK_PROBE_CONCURRENCY / UPLINK_PROBE_WAIT_SECONDS）：这是防「宿主上行争用」，
+        不是防成本。测速流量走的是宿主自己的上行出口，N 条并发时每条只能分到「宿主带宽 ÷ N」，
+        快线会被系统性压到门槛附近（部署机直连上行 ~2570KB/s，并发 30 时 ≈85KB/s，正好卡在门槛线上），
+        结果是排序失真 + 临界线误杀，而且并发越高越严重。所以用**有界获取**：等不到名额就跳过这一轮
+        （不发流量、不写缓存），由 D4（measured==0 放行）保证这条线路不会被误判成慢线。
+        """
+        if not self._uplink_active(profile) or _is_stopped(stop_event):
+            return
+        cache_key = _proxy_key(proxy)
+        if hint is not None:
+            self._apply_uplink_hint(result, int(hint), "reuse")
+            return
+        cached = self._uplink_cache_get(cache_key)
+        if cached is not None:
+            self._apply_uplink_hint(result, cached, "cache")
+            return
+
+        # 并发闸（防宿主上行争用，不是防成本）：只对「真要发测速」的分支拿名额——
+        # hint 复用与缓存命中在上面已经返回，不占名额，否则会白白挤掉别的线路。
+        # 有界获取：等不到名额就跳过这一轮（不发流量、不写缓存），由 D4 兜底放行。
+        acquired, gate = await self._acquire_uplink_gate()
+        if not acquired:
+            self._mark_uplink_busy(result)
+            return
+        try:
+            marks: List[Tuple[int, float]] = []
+            started = time.monotonic()
+            budget = max(1, int(self.config.uplink_budget))
+            need = max(UPLINK_CHUNK_BYTES, int(self.config.uplink_min_bytes))
+            min_kbps = int(self.config.uplink_min_kbps)
+
+            async def body() -> "AsyncIterator[bytes]":
+                sent = 0
+                chunk = b"x" * UPLINK_CHUNK_BYTES
+                while sent < need:
+                    yield chunk
+                    sent += UPLINK_CHUNK_BYTES
+                    marks.append((sent, (time.monotonic() - started) * 1000.0))
+                    elapsed = time.monotonic() - started
+                    if elapsed >= budget:
+                        return
+                    if elapsed >= UPLINK_SLOW_ABORT_SECONDS and sent >= UPLINK_SKIP_BYTES * 2:
+                        kbps, _ = self._uplink_rate(marks, UPLINK_SKIP_BYTES, need)
+                        if kbps is not None and kbps < min_kbps / 2:
+                            return
+                    if _is_stopped(stop_event):
+                        return
+
+            async def run() -> int:
+                # 不手写 Content-Length：生成器走 chunked，手写的长度会和实际字节数冲突。
+                async with session.stream(
+                    "POST",
+                    UPLINK_SPEED_URL,
+                    proxies=dict(proxy),
+                    timeout=budget,
+                    headers={"Content-Type": "application/octet-stream"},
+                    content=body(),
+                    allow_redirects=False,
+                ) as response:
+                    return int(getattr(response, "status_code", 0) or 0)
+
+            status: Optional[int] = None
+            error: Optional[str] = None
+            try:
+                status = await asyncio.wait_for(run(), timeout=budget + 2)
+            except asyncio.TimeoutError:
+                # 第二道闸生效：不再等待，直接用已有里程碑算读数。
+                error = "budget"
+            except Exception as exc:  # noqa: BLE001 —— 测速失败绝不向上抛（D6）
+                error = classify_error(str(exc))
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            self._finalize_uplink(result, marks, status, error, elapsed_ms, cache_key)
+        finally:
+            # 名额必须无条件归还：单条硬超时会取消本协程，取消路径同样要 release。
+            if gate is not None:
+                gate.release()
 
     def check_proxy_full(
         self,
@@ -406,15 +915,23 @@ class ProxyCheckEngine:
             discovered_ip = None
 
         round_results: List[RoundResult] = []
+        # D2：带宽比「可达性」稳定得多，每条线路只测首轮，后续轮直接把读数复用过去。
+        # 每轮都测 = 每条线 2MiB × N 轮 + 最坏 40s × N，批量巡检吞吐会被直接拖垮。
+        uplink_hint: Optional[int] = None
         for index in range(total_rounds):
             if _is_stopped(stop_event):
                 break
             ip_hint = discovered_ip if index == 0 else None
-            round_results.append(self.check_once(proxy_input, profile, stop_event, self.config.timeout, ip_hint))
+            round_result = self.check_once(
+                proxy_input, profile, stop_event, self.config.timeout, ip_hint, uplink_hint
+            )
+            round_results.append(round_result)
+            if round_result.up_kbps is not None:
+                uplink_hint = round_result.up_kbps
 
         if _is_stopped(stop_event) or len(round_results) != total_rounds:
             return None
-        summary = ScoreAggregator(total_rounds, profile).summarize(round_results)
+        summary = self._summarize(total_rounds, profile, round_results)
         protocol = proxy_input.split("://", 1)[0] if "://" in proxy_input else None
         return _build_public_result(proxy_input, original, protocol, profile, summary)
 
@@ -445,15 +962,22 @@ class ProxyCheckEngine:
             discovered_ip = None
 
         round_results: List[RoundResult] = []
+        # D2：只测首轮，后续轮复用读数（见同步路径同一处注释）。
+        uplink_hint: Optional[int] = None
         for index in range(total_rounds):
             if _is_stopped(stop_event):
                 break
             ip_hint = discovered_ip if index == 0 else None
-            round_results.append(await self.check_once_async(proxy_input, profile, session, stop_event, self.config.timeout, ip_hint))
+            round_result = await self.check_once_async(
+                proxy_input, profile, session, stop_event, self.config.timeout, ip_hint, uplink_hint
+            )
+            round_results.append(round_result)
+            if round_result.up_kbps is not None:
+                uplink_hint = round_result.up_kbps
 
         if _is_stopped(stop_event) or len(round_results) != total_rounds:
             return None
-        summary = ScoreAggregator(total_rounds, profile).summarize(round_results)
+        summary = self._summarize(total_rounds, profile, round_results)
         protocol = proxy_input.split("://", 1)[0] if "://" in proxy_input else None
         return _build_public_result(proxy_input, original, protocol, profile, summary)
 
@@ -464,6 +988,7 @@ class ProxyCheckEngine:
         stop_event: Optional[StopEvent] = None,
         timeout: Optional[int] = None,
         ip_hint: Optional[str] = None,
+        uplink_hint: Optional[int] = None,
     ) -> RoundResult:
         if _is_stopped(stop_event):
             return RoundResult.stopped()
@@ -481,6 +1006,10 @@ class ProxyCheckEngine:
             self._probe_ip_info(result)
         else:
             self._probe_ip(result, proxy)
+        # 上行测速（同步路径）放在最后：它最贵，且要求服务已可达。
+        # 成本闸门（D5）：连服务都摸不到的线路不烧 2MiB 上行。
+        if result.service_reachable:
+            self._probe_uplink_sync(result, profile, proxy, uplink_hint, stop_event)
         return result
 
     async def check_once_async(
@@ -491,6 +1020,7 @@ class ProxyCheckEngine:
         stop_event: Optional[StopEvent] = None,
         timeout: Optional[int] = None,
         ip_hint: Optional[str] = None,
+        uplink_hint: Optional[int] = None,
     ) -> RoundResult:
         if _is_stopped(stop_event):
             return RoundResult.stopped()
@@ -509,6 +1039,12 @@ class ProxyCheckEngine:
             checks.append(self._probe_ip_info_async(session, result))
         else:
             checks.append(self._probe_ip_async(session, result, proxy))
+        if self._uplink_active(profile) and result.service_reachable:
+            # 成本闸门（D5）：服务都不可达的线路不烧 2MiB 上行。
+            # 与既有探针并行，所以不额外抬高单条线路的墙钟时间（预算内同理）。
+            checks.append(
+                self._probe_uplink_async(session, result, profile, proxy, stop_event, uplink_hint)
+            )
         await asyncio.gather(*checks)
         return result
 
@@ -1111,9 +1647,23 @@ def _apply_ip_info_summary(result: RoundResult, summary: IpInfoSummary, cached: 
 
 
 class ScoreAggregator:
-    def __init__(self, rounds: int, profile: TargetProfile):
+    def __init__(
+        self,
+        rounds: int,
+        profile: TargetProfile,
+        uplink_enabled: Optional[bool] = None,
+        uplink_min_kbps: Optional[int] = None,
+    ):
         self.rounds = rounds
         self.profile = profile
+        # 默认值从全局开关 + 档位推导，保证既有 ScoreAggregator(rounds, profile) 调用不漏参；
+        # 引擎内部走 ProxyCheckEngine._summarize，会把 config.json 的值显式传进来。
+        self.uplink_enabled = (
+            bool(UPLINK_PROBE_ENABLED and profile.uplink_probe)
+            if uplink_enabled is None
+            else bool(uplink_enabled)
+        )
+        self.uplink_min_kbps = UPLINK_MIN_KBPS if uplink_min_kbps is None else int(uplink_min_kbps)
 
     def summarize(self, results: Sequence[RoundResult]) -> ScoreSummary:
         representative = self._representative(results)
@@ -1133,6 +1683,19 @@ class ScoreAggregator:
         }
         aux_ok = {key: passed == self.rounds for key, passed in aux_passed.items()}
         gates = {key: aux_ok.get(key, False) for key in self.profile.required_probes}
+
+        # 上行门禁（D4）：与 required_probes 相互独立——required_probes 回答「摸不摸得到目标」，
+        # 上行门禁回答「够不够快」（下游 324KB 请求体在 <85KB/s 的线路上要 >4s 才传完）。
+        # 语义刻意是「测不到 ≠ 不达标」：measured == 0 时放行，因为测速端点被墙 / 库版本不支持 /
+        # 全部超时都是**基础设施问题**，让它们把整个仓库判成无效是生产事故（方案 §8 同理）。
+        # 但只要任何一轮测到读数，就按「够不够快」严格卡（方案 §2.7 的 uplink_passed == rounds，
+        # 在「每轮都有读数」的前提下与本条等价：复用机制保证后续轮也有读数）。
+        uplink_readings = [result.up_kbps for result in results if result.up_kbps is not None]
+        uplink_measured = len(uplink_readings)
+        uplink_passed = sum(1 for value in uplink_readings if value >= self.uplink_min_kbps)
+        if self.uplink_enabled:
+            uplink_gate_ok = (uplink_measured == 0) or (uplink_passed == self.rounds)
+            gates = {**gates, "uplink": uplink_gate_ok}
 
         if self.profile.id == "generic":
             raw_valid = service_ok and base_ok
@@ -1163,9 +1726,21 @@ class ScoreAggregator:
         # 门禁：required_probes 必须每轮全通。grade 回答「这条线路本身质量如何」，
         # 门禁回答「它对本档目标到底有没有用」——B/C 级线路可能根本摸不到目标入口
         # （例如能开 z.ai 网页、出口 IP 也通，却到不了 ZCode 业务域名），不该算有效。
+        uplink_median = round(statistics.median(uplink_readings)) if uplink_readings else None
         gate_ok = all(gates.values())
         valid = raw_valid and gate_ok
-        usable_reason = "" if valid else _usable_reason(self.profile, gates, aux_passed, self.rounds)
+        usable_reason = (
+            ""
+            if valid
+            else _usable_reason(
+                self.profile,
+                gates,
+                aux_passed,
+                self.rounds,
+                uplink_kbps=uplink_median,
+                uplink_min_kbps=self.uplink_min_kbps,
+            )
+        )
 
         best_passed = max(service_passed, api_passed, base_passed)
         # unstable 沿用「线路本身不稳」的原语义，刻意不受门禁影响：一条 A 级却摸不到
@@ -1188,6 +1763,18 @@ class ScoreAggregator:
             "aux_ok": aux_ok,
             "required_probes": list(self.profile.required_probes),
             "gates": gates,
+            # 上行相关明细只在该档启用测速时出现：非 zai 档的 summary 输出必须逐字不变。
+            **(
+                {
+                    "uplink_passed": uplink_passed,
+                    "uplink_measured": uplink_measured,
+                    "uplink_min_kbps": self.uplink_min_kbps,
+                    "uplink_kbps": uplink_median,
+                    "uplink_error": next((r.up_error for r in results if r.up_error), None),
+                }
+                if self.uplink_enabled
+                else {}
+            ),
             "usable": valid,
             "usable_reason": usable_reason,
             "target_profile": self.profile.id,
@@ -1290,16 +1877,28 @@ def _usable_reason(
     gates: Mapping[str, bool],
     aux_passed: Mapping[str, int],
     rounds: int,
+    uplink_kbps: Optional[int] = None,
+    uplink_min_kbps: int = 0,
 ) -> str:
-    """门禁未通过时给一句可直接展示的原因；门禁全过（或该档没有门禁）时返回空串。"""
+    """门禁未通过时给一句可直接展示的原因；门禁全过（或该档没有门禁）时返回空串。
+
+    uplink 这个 gate key 必须单独处理：它回答的是「够不够快」，不是「通不通」。
+    沿用 aux 的「不可达(x/y)」文案会渲染成「uplink 不可达(0/2)」，既看不懂也不准确。
+    """
     failed = [key for key, ok in gates.items() if not ok]
     if not failed:
         return ""
     labels = {probe.key: (probe.label or probe.key) for probe in profile.aux_probes}
-    return "、".join(
-        "%s 不可达(%d/%d)" % (labels.get(key, key), aux_passed.get(key, 0), rounds)
-        for key in failed
-    )
+    parts: List[str] = []
+    for key in failed:
+        if key == "uplink":
+            if uplink_kbps is None:
+                parts.append("上行未测到（低于门槛 %dKB/s）" % uplink_min_kbps)
+            else:
+                parts.append("上行 %sKB/s 低于门槛 %dKB/s" % (uplink_kbps, uplink_min_kbps))
+            continue
+        parts.append("%s 不可达(%d/%d)" % (labels.get(key, key), aux_passed.get(key, 0), rounds))
+    return "、".join(parts)
 
 
 def _recommended_use(
@@ -1419,6 +2018,10 @@ def _build_public_result(
         "checks_total": summary.checks_total,
         "error": error,
         "latency": summary.latency,
+        # 上行吞吐（KB/s）：与 latency 并列的第二个维度，server.py 直接取这两个键。
+        # 取的是各轮中位数（summary.detail），不是代表轮的单个读数。
+        "up_kbps": summary.detail.get("uplink_kbps"),
+        "up_error": summary.detail.get("uplink_error"),
         "status_code": result.status_code,
         "ip": result.ip,
         "country": result.country,
@@ -1456,6 +2059,10 @@ def _failure_result(original: str, rounds: int, profile: TargetProfile, error: s
         "checks_total": rounds,
         "error": _apply_failure_hint(error, profile),
         "latency": None,
+        # 失败条目也必须带这两个键：server.py 的 result.get("up_kbps") 在两类条目上要一致，
+        # 少一个键会让下游导出逻辑出现「有的行有、有的行没有」的不一致。
+        "up_kbps": None,
+        "up_error": None,
         "status_code": None,
         "ip": None,
         "country": None,
@@ -1548,6 +2155,15 @@ def _apply_failure_hint(
     if result is None or (result.status_code is None and not result.cf_challenge):
         return error
     return f"{error}（{profile.failure_hint}）"
+
+
+def _proxy_key(proxy: Mapping[str, str]) -> str:
+    """上行读数的缓存键：优先 https（测速端点走 https），回退 http。
+
+    刻意用完整 proxy URL 作键：免费代理频繁换 IP:port，换端口就是另一条线路，
+    用完整串做键正好让「换了端口」天然失效。
+    """
+    return str(proxy.get("https") or proxy.get("http") or "")
 
 
 def _is_stopped(stop_event: Optional[StopEvent]) -> bool:

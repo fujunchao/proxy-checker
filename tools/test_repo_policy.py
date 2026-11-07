@@ -1,9 +1,11 @@
 """仓库入库口径（result_matches_policy / compact_repo_item）的自检脚本。
 
-覆盖三类断言：
+覆盖五类断言：
   1) 策略白名单集中定义且完整（REPO_UPDATE_POLICIES 与 normalize 校验同步）
   2) stable_only 不再收 C 级（仅出口 IP 通、本档目标一个都不通），target_only 只收 usable
   3) 新增结果字段（usable / usable_reason / aux_reachable）能穿过 compact_repo_item 白名单
+  4) 上行读数（up_kbps / up_error）能透传、能落库，且缺失时不伪造默认值
+  5) ?up_min 上行过滤的语义与位置（先过滤再 limit）、comment 渲染顺序、以及不带参数时的逐字回归
 
 用法：
     python tools/test_repo_policy.py
@@ -204,6 +206,12 @@ def test_export_filters() -> None:
     check("exclude_shared_ip=1 排除复用出口",
           len(filt("exclude_shared_ip=1")) == 2, len(filt("exclude_shared_ip=1")))
     check("limit=2 截断", len(filt("limit=2")) == 2, len(filt("limit=2")))
+    check("无 up_kbps 的条目 comment 渲染逐字不变（老订阅链接）",
+          server.render_repo_txt([{"proxy": "http://1.2.3.4:8080", "grade": "A", "latency": 120,
+                                   "pass_streak": 3}], comment=True)
+          == "# grade=A latency=120 pass_streak=3\nhttp://1.2.3.4:8080",
+          server.render_repo_txt([{"proxy": "http://1.2.3.4:8080", "grade": "A", "latency": 120,
+                                   "pass_streak": 3}], comment=True))
     check("未知参数值不影响（proto=xxx 不过滤）", len(filt("proto=xxx")) == 4, len(filt("proto=xxx")))
     check("非法 limit 忽略", len(filt("limit=abc")) == 4, len(filt("limit=abc")))
 
@@ -253,6 +261,125 @@ def test_streak_and_shared_ip() -> None:
           == written[0]["proxy"])
 
 
+def _repo_uplink_sample() -> list:
+    """上行维度专用样本：把不达标的放在最前面，用来验证 up_min 与 limit 的先后顺序。"""
+    return [
+        {"proxy": "socks4://3.3.3.3:1080", "grade": "C", "up_kbps": 12, "latency": 4000},
+        {"proxy": "http://1.1.1.1:8080", "grade": "A", "up_kbps": 320, "latency": 100, "pass_streak": 3},
+        {"proxy": "socks5://2.2.2.2:1080", "grade": "B", "up_kbps": 85, "latency": 900},
+        # 本维度上线前入库的旧条目：没有 up_kbps。
+        {"proxy": "https://4.4.4.4:443", "grade": "A", "latency": 250},
+        # 脏值：人工往仓库里塞坏数据也不能让导出 500。
+        {"proxy": "http://5.5.5.5:8080", "grade": "B", "up_kbps": "bad-value"},
+    ]
+
+
+def test_uplink_fields() -> None:
+    section("6. 上行读数（up_kbps / up_error）透传与落库")
+    compact = server.compact_repo_item({"proxy": "http://1.2.3.4:8080", "grade": "A", "up_kbps": 240,
+                                        "up_error": None})
+    check("compact 保留 up_kbps", compact.get("up_kbps") == 240, compact.get("up_kbps"))
+    check("up_error 为空时不塞键", "up_error" not in compact, compact.get("up_error"))
+    check("compact 保留 up_error",
+          server.compact_repo_item({"proxy": "http://1.2.3.4:8080", "grade": "F",
+                                    "up_error": "timeout"}).get("up_error") == "timeout")
+    check("旧条目不被塞 up_kbps 默认值",
+          "up_kbps" not in server.compact_repo_item({"proxy": "http://1.2.3.4:8080", "grade": "A"}))
+    check("up_kbps=0 原样保留（是实测读数，不是缺失）",
+          server.compact_repo_item({"proxy": "http://1.2.3.4:8080", "up_kbps": 0}).get("up_kbps") == 0)
+
+    ok_item = server.result_to_repo_item({"proxy": "http://1.2.3.4:8080", "grade": "A", "usable": True,
+                                          "up_kbps": 240, "up_error": None})
+    check("写库透出 up_kbps", ok_item.get("up_kbps") == 240, ok_item.get("up_kbps"))
+    check("写库不带空 up_error", "up_error" not in ok_item, ok_item.get("up_error"))
+    bad_item = server.result_to_repo_item({"proxy": "http://1.2.3.4:8080", "grade": "F", "usable": False,
+                                           "up_kbps": None, "up_error": "timeout"})
+    check("写库透出 up_error", bad_item.get("up_error") == "timeout", bad_item.get("up_error"))
+    check("测速失败不伪造 up_kbps=0", "up_kbps" not in bad_item, bad_item.get("up_kbps"))
+
+    # 读数粘性：测不到 ≠ 变慢。旧读数在新测量出现前继续代表这条线，
+    # 否则测速端点一挂，整仓读数被抹掉、?up_min 订阅会瞬间变空（与 D4 同一取舍）。
+    retained = server.result_to_repo_item(
+        {"proxy": "http://1.2.3.4:8080", "grade": "A", "usable": True, "up_kbps": None,
+         "up_error": "timeout"}, existing=ok_item)
+    check("本轮无读数 → 沿用旧读数（不抹掉历史）", retained.get("up_kbps") == 240, retained.get("up_kbps"))
+    check("沿用旧读数时仍记录本轮 up_error（两者可并存）",
+          retained.get("up_error") == "timeout", retained.get("up_error"))
+    overwritten = server.result_to_repo_item(
+        {"proxy": "http://1.2.3.4:8080", "grade": "A", "usable": True, "up_kbps": 50}, existing=ok_item)
+    check("有新读数 → 覆盖旧读数（带宽会漂移，新测量更可信）",
+          overwritten.get("up_kbps") == 50, overwritten.get("up_kbps"))
+    check("有新读数时清掉上一轮的 up_error", "up_error" not in overwritten, overwritten.get("up_error"))
+    still_missing = server.result_to_repo_item(
+        {"proxy": "http://1.2.3.4:8080", "grade": "F", "usable": False, "up_kbps": None,
+         "up_error": "timeout"}, existing={"proxy": "http://1.2.3.4:8080", "grade": "F"})
+    check("无旧读数且本轮无读数 → 仍然没有 up_kbps", "up_kbps" not in still_missing, still_missing)
+    check("up_kbps=0 不当成「无读数」（0 是实测值，不触发沿用）",
+          server.result_to_repo_item({"proxy": "http://1.2.3.4:8080", "grade": "A", "up_kbps": 0},
+                                     existing=ok_item).get("up_kbps") == 0)
+
+    written = server.write_repo_data("t-uplink-test", _repo_uplink_sample())
+    stored = {item["proxy"]: item for item in written}
+    check("落库后 up_kbps 保存在仓库 JSON 里",
+          stored["http://1.1.1.1:8080"].get("up_kbps") == 320, stored["http://1.1.1.1:8080"])
+    check("落库后读回一致", server.read_repo_data("t-uplink-test") == written)
+
+
+def test_uplink_export() -> None:
+    section("7. ?up_min 上行过滤与 comment 渲染")
+    from urllib.parse import parse_qs
+
+    check("EXPORT_PARAMS 含 up_min", "up_min" in server.EXPORT_PARAMS, server.EXPORT_PARAMS)
+    check("带 up_min 触发动态渲染", server.repo_export_filtered({"up_min": ["85"]}) is True)
+    check("未知参数不触发动态渲染", server.repo_export_filtered({"foo": ["1"]}) is False)
+
+    repo = server.annotate_shared_ips(server.compact_repo(_repo_uplink_sample()))
+
+    def filt(query: str) -> list:
+        return server.filter_repo_for_export(repo, parse_qs(query))
+
+    def ups(items: list) -> list:
+        return sorted(server.up_kbps_of(item) for item in items)
+
+    check("up_min=85 只留达标读数（边界 85 算达标）", ups(filt("up_min=85")) == [85, 320], ups(filt("up_min=85")))
+    check("up_min=100 排除边界", ups(filt("up_min=100")) == [320], ups(filt("up_min=100")))
+    check("缺 up_kbps 的旧条目视为不达标",
+          all(item.get("proxy") != "https://4.4.4.4:443" for item in filt("up_min=85")))
+    check("脏值 up_kbps 视为不达标且不抛异常",
+          all(item.get("proxy") != "http://5.5.5.5:8080" for item in filt("up_min=85")))
+    check("up_min=0 忽略（等同未指定）", len(filt("up_min=0")) == len(repo), len(filt("up_min=0")))
+    check("非法 up_min 忽略", len(filt("up_min=abc")) == len(repo), len(filt("up_min=abc")))
+    check("负数 up_min 忽略", len(filt("up_min=-5")) == len(repo), len(filt("up_min=-5")))
+    check("up_min 与 limit 组合：先过滤后截断（否则会导出空）",
+          [item.get("up_kbps") for item in filt("up_min=85&limit=1")] == [320],
+          [item.get("up_kbps") for item in filt("up_min=85&limit=1")])
+    check("与既有参数叠加不报错（usable=1&up_min=85）",
+          len(filt("usable=1&up_min=85")) == 0, len(filt("usable=1&up_min=85")))
+
+    commented = server.render_repo_txt([{"proxy": "http://1.2.3.4:8080", "grade": "A", "latency": 120,
+                                         "up_kbps": 320, "pass_streak": 3}], comment=True)
+    check("comment 里 up_kbps 位于 latency 之后、pass_streak 之前",
+          commented.splitlines()[0] == "# grade=A latency=120 up_kbps=320 pass_streak=3",
+          commented.splitlines()[0])
+    plain = server.render_repo_txt(repo)
+    check("TXT 默认仍是纯地址行（不带参数逐字不变）",
+          plain == "\n".join(item["proxy"] for item in repo), plain)
+
+
+def test_compose_passthrough() -> None:
+    section("8. 部署透传：compose 必须带上回滚开关")
+    compose_path = os.path.join(BASE_DIR, "docker-compose.yml")
+    with open(compose_path, encoding="utf-8") as handle:
+        compose_text = handle.read()
+    # compose 的 environment 是白名单：漏写就等于「.env 里设了也不生效」，
+    # 而方案 §8 的回滚全靠 UPLINK_PROBE=0，所以这里把它固化成语义断言。
+    check("compose 透传 UPLINK_PROBE",
+          'UPLINK_PROBE: "${UPLINK_PROBE:-1}"' in compose_text)
+    check("compose 透传 UPLINK_MIN_KBPS",
+          'UPLINK_MIN_KBPS: "${UPLINK_MIN_KBPS:-85}"' in compose_text)
+    check("compose 注释里写明是回滚透传点", "回滚" in compose_text and "§8" in compose_text)
+
+
 def main() -> None:
     print("仓库入库口径自检开始")
     try:
@@ -262,6 +389,9 @@ def main() -> None:
         test_compact_fields()
         test_export_filters()
         test_streak_and_shared_ip()
+        test_uplink_fields()
+        test_uplink_export()
+        test_compose_passthrough()
     finally:
         shutil.rmtree(_TMP, ignore_errors=True)
 
