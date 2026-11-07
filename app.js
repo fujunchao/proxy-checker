@@ -1167,6 +1167,7 @@ var USER_TOKEN_KEY='proxy_checker_token';
 var REPO_SYNCED_KEY='proxy_checker_synced';
 var REPO_CLEARED_KEY='repo_manually_cleared';
 var repoCache=null,repoCacheRevision=null,repoCacheGeneration=0;
+var repoSaveSequence=0;
 var userTokenCache=null;
 
 function readRepoSyncMeta(){
@@ -1185,6 +1186,8 @@ function getRepoBaseCount(repo){
 function saveRepoRequest(repo,mode,baseCount,callback){
   loadRepo();
   var revision=repoCacheRevision,generation=repoCacheGeneration,identity=workspaceEpoch;
+  // 新保存开始就使之前的回读失效，避免回读增加代次后丢掉本次保存的成功响应。
+  var saveSequence=++repoSaveSequence;
   var submitted=compactRepo(repo);
   var payload={repo:submitted,token:getUserToken(),mode:mode,base_count:baseCount,base_revision:revision};
   post('/api/repo/save',payload,function(err,res){
@@ -1195,21 +1198,22 @@ function saveRepoRequest(repo,mode,baseCount,callback){
       saveRepo(submitted,{sync:false,revision:res.repo_revision});
       // 服务端会保护 up_kbps/up_error 这类只读测量字段，submitted 里没有它们；
       // 不回读的话仓库列表要刷新页面才看得到读数（P2）。
-      refreshRepoAfterSave(res.repo_revision);
+      refreshRepoAfterSave(res.repo_revision,saveSequence);
     }
     callback(err,res);
   });
 }
 
-function refreshRepoAfterSave(savedRevision){
+function refreshRepoAfterSave(savedRevision,saveSequence){
   // 保存成功后后台回读云端仓库：服务端保护下来的 up_kbps/up_error 只能从服务端拿回来。
   // 用当前代次做守卫——回读期间用户又改了仓库就放弃回写；silent 保证失败不打扰用户；
   // sync:false（loadRepoFromServer 内部就是）保证回读不会再触发一次同步，不会打成循环。
+  if(saveSequence!==repoSaveSequence)return;
   var expected=repoCacheGeneration;
   // requireSource:'json' —— 只有 JSON 快照才允许回写。txt 兜底是「只有地址」的占位条目
   // （grade='?'、没有 latency/ip/usable/up_kbps），拿它覆盖本地缓存等于把读数与元信息一起抹掉。
   loadRepoFromServer(function(){}, {expectedGeneration:expected, silent:true, replaceEmpty:false,
-    requireSource:'json', fallbackRevision:savedRevision});
+    expectedSaveSequence:saveSequence, requireSource:'json', fallbackRevision:savedRevision});
 }
 
 function compactRepoItem(p){
@@ -2060,6 +2064,7 @@ function loadRepoFromServer(callback,options){
   // 拿它覆盖本地缓存等于把 grade/latency/up_kbps 一起抹成占位值。
   function applyRepo(repo,count,revision,updateCount,source){
     if(options.expectedGeneration!==undefined&&options.expectedGeneration!==repoCacheGeneration)return false;
+    if(options.expectedSaveSequence!==undefined&&options.expectedSaveSequence!==repoSaveSequence)return false;
     if(options.requireSource&&options.requireSource!==source)return false;
     saveRepo(repo,{sync:false,revision:revision});
     rememberRepoSync(count,revision);

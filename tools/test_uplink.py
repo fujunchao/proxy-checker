@@ -1611,20 +1611,28 @@ def test_process_wide_state() -> None:
 
         # 17.5 基线整体硬超时：卡住的直连不许拖过 UPLINK_BASELINE_TOTAL_SECONDS
         proxy_check.reset_uplink_baseline_state()
-        proxy_check.UPLINK_BASELINE_TOTAL_SECONDS = 1
+        proxy_check.UPLINK_BASELINE_TOTAL_SECONDS = 2
         engine_f = make_engine()
+        deadline_calls = {"started": 0, "cancelled": 0}
 
         async def hanging_transfer(session, proxy, stop_event=None, budget=None):
             if proxy:
                 return _marks_at(2000), 200, None, 100.0
-            await asyncio.sleep(5.0)       # 卡住，远超总 deadline
+            deadline_calls["started"] += 1
+            try:
+                await asyncio.sleep(5.0)       # 卡住，远超总 deadline
+            except asyncio.CancelledError:
+                deadline_calls["cancelled"] += 1
+                raise
             return _marks_at(3400), 200, None, 5000.0
 
         engine_f._transfer_uplink_async = hanging_transfer  # type: ignore[method-assign]
         started = time.time()
         value = asyncio.run(engine_f.warm_uplink_baseline_async())
         elapsed = time.time() - started
-        check("基线总超时：在 TOTAL+缓冲 内返回", elapsed <= 1 + 2.5, round(elapsed, 1))
+        check("基线总超时：实际进入并取消卡住的传输",
+              deadline_calls == {"started": 1, "cancelled": 1}, deadline_calls)
+        check("基线总超时：在 TOTAL+收尾余量 内返回", elapsed <= 2 + 0.5, round(elapsed, 1))
         check("总超时后放弃截断（基线为 None）", value is None and proxy_check.get_uplink_baseline() is None,
               value)
         check("总超时也算已尝试（不重试）", proxy_check.uplink_baseline_attempted() is True)
@@ -1685,6 +1693,66 @@ def test_process_wide_state() -> None:
         proxy_check.reset_uplink_baseline_state()
 
 
+def test_baseline_owner_cancellation() -> None:
+    section("18. 基线执行者在静默传输中及时停止，并归还配额")
+    original = (proxy_check.UPLINK_BASELINE_KBPS, proxy_check.UPLINK_BASELINE_TOTAL_SECONDS)
+    try:
+        proxy_check.UPLINK_BASELINE_KBPS = 0
+        proxy_check.UPLINK_BASELINE_TOTAL_SECONDS = 10
+
+        async def run_case(cancel_task: bool) -> None:
+            proxy_check.reset_uplink_baseline_state()
+            engine = make_engine()
+            stop = threading.Event()
+            entered, cancelled = asyncio.Event(), asyncio.Event()
+            published = []
+
+            async def blocked_transfer(session, proxy, stop_event=None, budget=None):
+                assert not proxy, "本用例只能进入基线直连"
+                entered.set()
+                try:
+                    await asyncio.Future()  # 没有块和响应，不能依靠生成器检查停止信号。
+                finally:
+                    cancelled.set()
+
+            engine._transfer_uplink_async = blocked_transfer
+            task = asyncio.create_task(engine.check_many_async(
+                ["http://192.0.2.80:80"], stop, 2, 1, published.append, "zai"))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                if cancel_task:
+                    task.cancel()
+                else:
+                    stop.set()
+                done, _ = await asyncio.wait([task], timeout=0.5)
+                label = "外层取消" if cancel_task else "API 停止事件"
+                check(label + "：静默传输中 0.5 秒内结束", task in done)
+                check(label + "：已经取消底层传输", cancelled.is_set())
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            check(label + "：不发布未完成结果", published == [])
+            check(label + "：基线标为已尝试并通知等待者",
+                  proxy_check.uplink_baseline_attempted() and proxy_check._BASELINE_DONE.is_set())
+            gate = proxy_check.uplink_gate()
+            taken = 0
+            try:
+                for _ in range(proxy_check.UPLINK_PROBE_CONCURRENCY):
+                    if gate.acquire(blocking=False):
+                        taken += 1
+                check(label + "：全部测速配额归还", taken == proxy_check.UPLINK_PROBE_CONCURRENCY, taken)
+            finally:
+                for _ in range(taken):
+                    gate.release()
+
+        asyncio.run(run_case(False))
+        asyncio.run(run_case(True))
+    finally:
+        proxy_check.UPLINK_BASELINE_KBPS, proxy_check.UPLINK_BASELINE_TOTAL_SECONDS = original
+        proxy_check.reset_uplink_baseline_state()
+
+
 def main() -> None:
     print("上行吞吐（up_kbps）自检开始")
     print(f"  UPLINK_PROBE={os.environ.get('UPLINK_PROBE')}  "
@@ -1707,6 +1775,7 @@ def main() -> None:
     test_timeout_includes_baseline()
     test_process_level_quota()
     test_process_wide_state()
+    test_baseline_owner_cancellation()
 
     total = len(PASSED) + len(FAILED)
     print(f"\n结果: {len(PASSED)}/{total} 通过，跳过 {len(SKIPPED)} 项")

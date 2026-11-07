@@ -1224,11 +1224,11 @@ class ProxyCheckEngine:
         v6.7.4 的四条硬约束：
           1. **整体 deadline**（UPLINK_BASELINE_TOTAL_SECONDS）：整个 N 轮必须在它之内结束。
              超时就用已有读数（够稳才用），否则放弃截断——宁可不截断，也不能一直占着批次预算；
-             单轮卡死也由 wait_for(budget+2) 兜住，不会拖过总 deadline。
+             独立监视传输任务，剩余总预算与单轮预算取更小值。
           2. **走同一把进程级配额**：基线也是宿主上行流量，和别的工作区的探针叠加会到 3 条并发；
              更糟的是争用下基线会被低估，截断值跟着偏低——那正是「错截快线」的入口。
              拿不到配额就放弃本次截断（不重试、不阻塞批次）。
-          3. 每轮之间、以及每轮内部（生成器逐块）都查 _is_stopped，停止请求在总 deadline 内生效。
+          3. 每轮之间、每个上传块以及传输等待期间都查 _is_stopped，静默连接也能取消。
           4. 测量本身**绝不参与截断**（否则基线会被上一次的基线越截越低）。
         """
         runs = max(1, int(UPLINK_BASELINE_RUNS))
@@ -1249,14 +1249,26 @@ class ProxyCheckEngine:
                 budget = self._baseline_round_budget(deadline)
                 if budget is None:
                     break
+                transfer = asyncio.create_task(
+                    self._transfer_uplink_async(session, {}, stop_event, budget=budget)
+                )
+                round_deadline = time.monotonic() + budget + 2
+                if deadline is not None:
+                    round_deadline = min(round_deadline, deadline)
                 try:
-                    marks, _status, _error, _elapsed = await asyncio.wait_for(
-                        self._transfer_uplink_async(session, {}, stop_event, budget=budget),
-                        timeout=budget + 2,
-                    )
-                except asyncio.TimeoutError:
-                    # 单轮卡住也不许拖过总 deadline：直接用已有读数收尾。
-                    break
+                    # 静默连接不会再调用上传生成器，必须在传输之外检查停止信号。
+                    # API 首次检测可能自己执行标定，同样要能及时取消并归还配额。
+                    while not transfer.done() and not _is_stopped(stop_event):
+                        remaining = round_deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        await asyncio.wait([transfer], timeout=min(0.05, remaining))
+                    if not transfer.done():
+                        break
+                    marks, _status, _error, _elapsed = transfer.result()
+                finally:
+                    # 停止、超时和外层批次取消都清理在途传输，再释放整个基线的名额。
+                    await _cancel_tasks([transfer])
                 kbps, _rate_error = self._uplink_rate(marks, UPLINK_SKIP_BYTES, need)
                 if kbps is not None:
                     readings.append(kbps)

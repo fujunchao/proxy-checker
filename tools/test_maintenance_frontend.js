@@ -247,5 +247,48 @@ assert.equal(jw.loadRepo()[0].latency, 100, 'latency 同样不能被占位值抹
 assert.equal(jw.loadRepo()[0].up_kbps, 320, '上行读数更不能被抹掉');
 assert.equal(toasts, 0, '回读失败必须是静默的，不打扰用户');
 
+// 保存后的回读不能让另一笔在途保存的成功响应失效。
+// 顺序：保存1成功 -> 回读1在途 -> 保存2发出 -> 回读1/保存2响应交错。
+for (const readFirst of [true, false]) {
+  const overlap = browser();
+  const token = 'save_overlap_' + Number(readFirst);
+  bind(overlap, token);
+  const ow = overlap.context;
+  const suffix = '/api/repo/' + token + '.json';
+  const rows = [{proxy: 'http://192.0.2.70:80', grade: 'A', up_kbps: 320}];
+  const initial = overlap.requests.find(r => r.url.endsWith(suffix));
+  initial.getResponseHeader = () => '1';
+  overlap.reply(initial, rows);
+  ow.syncRepoToServer();
+  const firstSave = overlap.requests.filter(r => r.url.endsWith('/api/repo/save')).at(-1);
+  const beforeFirstReply = overlap.requests.length;
+  overlap.reply(firstSave, {ok: true, count: 1, current_count: 1, repo_revision: 2});
+  const oldRead = overlap.requests.slice(beforeFirstReply).find(r => r.url.endsWith(suffix));
+  assert.ok(oldRead);
+  ow.saveRepoToCloud();
+  const secondSave = overlap.requests.filter(r => r.url.endsWith('/api/repo/save')).at(-1);
+  assert.equal(secondSave.body.base_revision, 2);
+  const replyOldRead = () => {
+    oldRead.getResponseHeader = () => '2';
+    overlap.reply(oldRead, rows);
+  };
+  if (readFirst) replyOldRead();
+  const beforeSecondReply = overlap.requests.length;
+  overlap.reply(secondSave, {ok: true, count: 1, current_count: 1, repo_revision: 3});
+  if (!readFirst) replyOldRead();
+  assert.equal(ow.repoCacheRevision, 3, '后台回读不能阻止成功保存推进本地版本');
+  const latestRead = overlap.requests.slice(beforeSecondReply).find(r => r.url.endsWith(suffix));
+  assert.ok(latestRead, '后一笔保存仍应回读权威快照');
+  latestRead.getResponseHeader = () => '3';
+  overlap.reply(latestRead, rows);
+  ow.addRepoItems([{proxy: 'http://192.0.2.71:80', grade: 'B'}]);
+  ow.syncRepoToServer();
+  const thirdSave = overlap.requests.filter(r => r.url.endsWith('/api/repo/save')).at(-1);
+  assert.equal(thirdSave.body.base_revision, 3, '下一次编辑必须携带已确认的新版本');
+  assert.equal(thirdSave.body.repo.length, 2, '交错后新增代理仍完整提交');
+  overlap.reply(thirdSave, {ok: true, count: 2, current_count: 1, repo_revision: 4});
+  assert.equal(ow.loadRepo().length, 2, '成功响应不能丢失新增代理');
+}
+
 dom.window.close();
 console.log('maintenance frontend ok');
