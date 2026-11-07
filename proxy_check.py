@@ -413,12 +413,11 @@ class ProxyCheckEngine:
         # 进程重启即丢失，可接受（见 UPLINK_REPROBE_SECONDS 的注释）。
         self._uplink_cache: Dict[str, Tuple[float, int]] = {}
         self._uplink_lock = threading.Lock()
-        # 并发闸（防宿主上行争用，见 UPLINK_PROBE_CONCURRENCY）。
-        # asyncio.Semaphore 会绑定首次使用它的事件循环，所以不能在这里建：
-        # 引擎可能在无事件循环的线程里构造（server.py 在模块级构造），测试也会反复 asyncio.run。
-        self._uplink_gate: Optional[asyncio.Semaphore] = None
-        self._uplink_gate_loop: Optional[asyncio.AbstractEventLoop] = None
-        # 同步路径没有事件循环，用线程侧的有界信号量（拿不到同样直接跳过）。
+        # 测速并发配额（防宿主上行争用，见 UPLINK_PROBE_CONCURRENCY）：**进程级唯一一把**。
+        # 闸保护的是宿主上行这条物理出口，跨事件循环/跨线程各持一份等于没有上限
+        # （server.py 每个批次都 asyncio.new_event_loop()，多工作区还会并行跑；
+        #  v6.7.3 之前用 per-loop asyncio.Semaphore，两个 loop 合计能跑到 2 倍配额）。
+        # 因此统一用 threading.BoundedSemaphore：异步侧非阻塞轮询 + asyncio.sleep，同步侧同一把锁。
         self._uplink_gate_sync: Optional[threading.BoundedSemaphore] = None
         # 宿主直连基线（上行读数的饱和上限）：进程内惰性测一次，重启重测。
         self._uplink_baseline: Optional[int] = None
@@ -447,6 +446,12 @@ class ProxyCheckEngine:
             max_clients=max_concurrent,
             impersonate=self.config.impersonate,
         ) as session:
+            # 宿主直连基线在**批次开始前**测完：它是「仪器标定」，不该占用任何一条线路的硬超时
+            # （v6.7.1 是惰性测在第一条线路里，3 × 20s 会把合法路径顶到 155s > 138s 被掐）。
+            # 此时还没起 worker，链路上没有任何测速流量，量出来的最干净。
+            if self._uplink_active(profile) and not _is_stopped(stop_event):
+                await self._ensure_uplink_baseline_async(session, stop_event)
+
             async def check_one(proxy: str) -> Optional[Dict[str, object]]:
                 try:
                     return await asyncio.wait_for(
@@ -505,10 +510,21 @@ class ProxyCheckEngine:
         #   service 24s（timeout12 × 2 次重试）+ aux 12s + max(api 12s, uplink 40s) = 76s
         # 后续轮没有测速：service 24s + aux 12s + api 12s = 48s，两轮合计 ≈124s。
         # 本函数的保守估算 = 88s（2×44）+ 40s（测速）= 128s，+10s 余量 = 138s，
-        # 138 > 124，仍然安全；上限 180s 也留了足够冗余。
+        # 138 > 124，仍然安全。
+        #
+        # **双保险（v6.7.3）**：v6.7.1 的基线在探针内部惰性测（3 × 20s = 60s），
+        # 却算在首条线路的硬超时里 → 合法路径 = 基线 60s + 上述 95s ≈ 155s，被 138s 掐掉。
+        # v6.7.3 把基线挪到**批次开始前**（check_many_async / check_proxy_full* 入口），
+        # 但本函数是在进 session 之前算的，那时基线还没测（_uplink_baseline_measured 为假），
+        # 所以这里再预留一次基线开销：Runs × 单次预算 + 等锁上限。上限同时提到 240s。
         if self._uplink_active(profile):
             expected_round_budget += max(0, int(self.config.uplink_budget))
-        return max(30, min(180, expected_round_budget + 10))
+            if not self._uplink_baseline_measured:
+                expected_round_budget += (
+                    max(1, int(UPLINK_BASELINE_RUNS)) * self._baseline_transfer_budget()
+                    + int(self._baseline_wait_seconds())
+                )
+        return max(30, min(240, expected_round_budget + 10))
 
     def _summarize(
         self,
@@ -587,54 +603,12 @@ class ProxyCheckEngine:
         with self._uplink_lock:
             self._uplink_cache[proxy] = (time.monotonic() + ttl, int(kbps))
 
-    # ── 上行测速的并发闸（防宿主上行争用，不是防成本）─────────────────────
-    def _uplink_gate_for_loop(self) -> Optional[asyncio.Semaphore]:
-        """取当前事件循环的并发闸；不启用（N<=0）时返回 None。
+    # ── 上行测速的并发配额（防宿主上行争用，不是防成本）───────────────────
+    def _uplink_gate(self) -> Optional[threading.BoundedSemaphore]:
+        """进程级并发配额（惰性创建）；UPLINK_PROBE_CONCURRENCY<=0 表示不限，返回 None。
 
-        asyncio.Semaphore 一旦被 await 就会绑定当时的事件循环，跨 loop 复用会抛
-        "is bound to a different event loop"。因此按 loop 惰性创建：生产只有一条 loop，
-        测试里反复 asyncio.run 也能各自拿到干净的闸门。
-        """
-        limit = int(UPLINK_PROBE_CONCURRENCY)
-        if limit <= 0:
-            return None
-        loop = asyncio.get_running_loop()
-        gate = self._uplink_gate
-        if gate is None or self._uplink_gate_loop is not loop:
-            gate = asyncio.Semaphore(limit)
-            self._uplink_gate = gate
-            self._uplink_gate_loop = loop
-        return gate
-
-    async def _acquire_uplink_gate(
-        self,
-    ) -> Tuple[bool, Optional[asyncio.Semaphore]]:
-        """有界获取测速名额：拿到返回 (True, gate)，等不到返回 (False, None)。
-
-        为什么是「有界」而不是「一直等」：维护批次有 120s 预算，等名额会把线路拖到
-        被批次砍掉（整轮无结果）；跳过只损失这一轮的读数，D4 下 measured==0 放行。
-        """
-        gate = self._uplink_gate_for_loop()
-        if gate is None:
-            return True, None
-        wait = int(UPLINK_PROBE_WAIT_SECONDS)
-        if wait <= 0:
-            # 不等待：事件循环是单线程的，locked() 与 acquire() 之间没有 await，判定安全。
-            if gate.locked():
-                return False, None
-            await gate.acquire()
-            return True, gate
-        try:
-            await asyncio.wait_for(gate.acquire(), timeout=wait)
-        except asyncio.TimeoutError:
-            return False, None
-        return True, gate
-
-    def _uplink_gate_for_thread(self) -> Optional[threading.BoundedSemaphore]:
-        """同步路径的并发闸（惰性创建）。
-
-        用 BoundedSemaphore 而不是 Lock：Lock 只能表达「最多 1 条」，
-        和异步侧的 UPLINK_PROBE_CONCURRENCY 不是同一个语义。
+        为什么必须是进程级：闸保护的是宿主上行这条物理出口。per-loop / per-thread 的配额
+        在多工作区、或多个 asyncio.run 批次并行时会各自放大，等于没有上限。
         """
         limit = int(UPLINK_PROBE_CONCURRENCY)
         if limit <= 0:
@@ -644,6 +618,46 @@ class ProxyCheckEngine:
             gate = threading.BoundedSemaphore(limit)
             self._uplink_gate_sync = gate
         return gate
+
+    def _uplink_gate_for_thread(self) -> Optional[threading.BoundedSemaphore]:
+        """历史名字（单测/内部沿用它），等价于 _uplink_gate()。"""
+        return self._uplink_gate()
+
+    async def _acquire_uplink_gate(
+        self,
+    ) -> Tuple[bool, Optional[threading.BoundedSemaphore]]:
+        """有界获取测速配额：拿到返回 (True, gate)，等不到返回 (False, None)。
+
+        实现刻意是**非阻塞轮询 + asyncio.sleep**，而不是 asyncio.Semaphore：
+        配额必须跨 loop/跨线程共享，asyncio 的信号量绑事件循环做不到这件事。
+        总等待受 UPLINK_PROBE_WAIT_SECONDS 限制：等不到就跳过这一轮（维护批次有 120s 预算，
+        让线路干等会把整轮拖出预算），D4 下 measured==0 放行，不会误杀线路。
+        """
+        gate = self._uplink_gate()
+        if gate is None:
+            return True, None
+        deadline = time.monotonic() + max(0, int(UPLINK_PROBE_WAIT_SECONDS))
+        while True:
+            if gate.acquire(blocking=False):
+                return True, gate
+            if time.monotonic() >= deadline:
+                return False, None
+            await asyncio.sleep(0.05)
+
+    def _acquire_uplink_gate_sync(
+        self,
+    ) -> Tuple[bool, Optional[threading.BoundedSemaphore]]:
+        """同步版：同一把进程级配额，非阻塞轮询 + time.sleep（同样的总等待上限）。"""
+        gate = self._uplink_gate()
+        if gate is None:
+            return True, None
+        deadline = time.monotonic() + max(0, int(UPLINK_PROBE_WAIT_SECONDS))
+        while True:
+            if gate.acquire(blocking=False):
+                return True, gate
+            if time.monotonic() >= deadline:
+                return False, None
+            time.sleep(0.05)
 
     def _mark_uplink_skipped(self, result: RoundResult, reason: str) -> None:
         """这一轮不测速（不发流量、不写缓存、不记读数），只记下跳过原因。
@@ -940,10 +954,10 @@ class ProxyCheckEngine:
             self._apply_uplink_hint(result, cached, "cache")
             return
 
-        # 并发闸：只在「真要发测速」的分支拿名额（hint 复用/缓存命中在上面已返回，不占名额）。
-        gate = self._uplink_gate_for_thread()
-        if gate is not None and not gate.acquire(blocking=False):
-            # 同步路径不等待（没有事件循环，等也只是空转）：拿不到就跳过这一轮。
+        # 并发配额：只在「真要发测速」的分支拿名额（hint 复用/缓存命中在上面已返回，不占名额）。
+        # 同步侧与异步侧**共用同一把进程级锁**，等不到就跳过这一轮。
+        acquired, gate = self._acquire_uplink_gate_sync()
+        if not acquired:
             self._mark_uplink_busy(result)
             return
         try:
@@ -1203,6 +1217,10 @@ class ProxyCheckEngine:
         else:
             discovered_ip = None
 
+        # 基线先测（同步入口，见 check_proxy_full_async 同一处注释）。
+        if self._uplink_active(profile) and not _is_stopped(stop_event):
+            self._ensure_uplink_baseline_sync(stop_event)
+
         round_results: List[RoundResult] = []
         # D2：带宽比「可达性」稳定得多，每条线路只测首轮，后续轮直接把读数复用过去。
         # 每轮都测 = 每条线 2MiB × N 轮 + 最坏 40s × N，批量巡检吞吐会被直接拖垮。
@@ -1249,6 +1267,10 @@ class ProxyCheckEngine:
             discovered_ip = discovery.ip
         else:
             discovered_ip = None
+
+        # 基线先测：这条入口也会被 tools/tests 直接调用，不能只依赖 check_many_async 的预测量。
+        if self._uplink_active(profile) and not _is_stopped(stop_event):
+            await self._ensure_uplink_baseline_async(session, stop_event)
 
         round_results: List[RoundResult] = []
         # D2：只测首轮，后续轮复用读数（见同步路径同一处注释）。
@@ -1990,15 +2012,18 @@ class ScoreAggregator:
 
         # 上行门禁（D4）：与 required_probes 相互独立——required_probes 回答「摸不摸得到目标」，
         # 上行门禁回答「够不够快」（下游 324KB 请求体在 <85KB/s 的线路上要 >4s 才传完）。
-        # 语义刻意是「测不到 ≠ 不达标」：measured == 0 时放行，因为测速端点被墙 / 库版本不支持 /
-        # 全部超时都是**基础设施问题**，让它们把整个仓库判成无效是生产事故（方案 §8 同理）。
-        # 但只要任何一轮测到读数，就按「够不够快」严格卡（方案 §2.7 的 uplink_passed == rounds，
-        # 在「每轮都有读数」的前提下与本条等价：复用机制保证后续轮也有读数）。
+        #
+        # 语义（v6.7.3 修正）：「**看有读数的轮次是否都达标**」。
+        # 旧写法是 uplink_passed == rounds，会把「首轮 busy/门禁跳过、次轮测到 400KB/s」
+        # 判成不达标——那是把基础设施抖动当慢线，自动维护会据此移除健康线路（review 指出的 P1）。
+        # 空列表 → all([]) 为 True → 放行，保留 D4「测不到 ≠ 不达标」：测速端点被墙 /
+        # 全部超时都是基础设施问题，不该连坐整个仓库（方案 §8 同理）。
         uplink_readings = [result.up_kbps for result in results if result.up_kbps is not None]
         uplink_measured = len(uplink_readings)
         uplink_passed = sum(1 for value in uplink_readings if value >= self.uplink_min_kbps)
+        uplink_min = min(uplink_readings) if uplink_readings else None
         if self.uplink_enabled:
-            uplink_gate_ok = (uplink_measured == 0) or (uplink_passed == self.rounds)
+            uplink_gate_ok = all(value >= self.uplink_min_kbps for value in uplink_readings)
             gates = {**gates, "uplink": uplink_gate_ok}
 
         if self.profile.id == "generic":
@@ -2041,8 +2066,9 @@ class ScoreAggregator:
                 gates,
                 aux_passed,
                 self.rounds,
-                uplink_kbps=uplink_median,
+                uplink_kbps=uplink_min,
                 uplink_min_kbps=self.uplink_min_kbps,
+                uplink_measured=uplink_measured,
             )
         )
 
@@ -2074,6 +2100,8 @@ class ScoreAggregator:
                     "uplink_measured": uplink_measured,
                     "uplink_min_kbps": self.uplink_min_kbps,
                     "uplink_kbps": uplink_median,
+                    # 最小读数：门禁按它判，usable_reason 也按它写，排查时不用自己再算。
+                    "uplink_min": uplink_min,
                     "uplink_error": next((r.up_error for r in results if r.up_error), None),
                 }
                 if self.uplink_enabled
@@ -2183,6 +2211,7 @@ def _usable_reason(
     rounds: int,
     uplink_kbps: Optional[int] = None,
     uplink_min_kbps: int = 0,
+    uplink_measured: Optional[int] = None,
 ) -> str:
     """门禁未通过时给一句可直接展示的原因；门禁全过（或该档没有门禁）时返回空串。
 
@@ -2196,10 +2225,17 @@ def _usable_reason(
     parts: List[str] = []
     for key in failed:
         if key == "uplink":
+            # uplink_kbps 传的是**最小读数**（门禁按它判），并注明测到几轮——
+            # 否则「1/2 轮测到」的线路会被读成「两轮都只有这个速度」。
             if uplink_kbps is None:
-                parts.append("上行未测到（低于门槛 %dKB/s）" % uplink_min_kbps)
-            else:
+                parts.append("上行未测到（门槛 %dKB/s）" % uplink_min_kbps)
+            elif uplink_measured is None:
                 parts.append("上行 %sKB/s 低于门槛 %dKB/s" % (uplink_kbps, uplink_min_kbps))
+            else:
+                parts.append(
+                    "上行 %sKB/s 低于门槛 %dKB/s（%d/%d 轮测到）"
+                    % (uplink_kbps, uplink_min_kbps, uplink_measured, rounds)
+                )
             continue
         parts.append("%s 不可达(%d/%d)" % (labels.get(key, key), aux_passed.get(key, 0), rounds))
     return "、".join(parts)

@@ -17,6 +17,10 @@ LOCKS = [threading.RLock() for _ in range(64)]
 MAX_ITEMS = 100000
 MAX_BYTES = 64 * 1024 * 1024
 MAX_OBSERVATIONS = 100000
+# UI 保存（/api/repo/save）无权改写的字段：它们是观测/来源类事实，只能由检测链路写入。
+# 保护是双向的——旧页面缺字段时不能被抹掉，新页面带了值也不能覆盖仓库里的既有事实。
+PROTECTED_ON_MANUAL_SAVE = ("last_ok", "last_checked_at", "pass_streak", "fail_count",
+                            "up_kbps", "up_error")
 
 
 class RepositoryError(RuntimeError):
@@ -172,7 +176,11 @@ class Repository:
                 previous = current_by_key.get(key)
                 if previous:
                     # UI 保存不是复测，不能伪造成功时间／计数，或因旧页面缺字段而抹掉它们。
-                    for field in ("last_ok", "last_checked_at", "pass_streak", "fail_count"):
+                    # up_kbps / up_error 是**只读测量字段**：只有检测链路（publish → convert）
+                    # 能写它们。所以这里是整条覆盖 incoming（replace 模式更是整仓重建）时，
+                    # 一律以仓库里已有的读数为准——否则一次浏览器保存就会把上行读数抹掉，
+                    # ?up_min 订阅会瞬间失去过滤依据。
+                    for field in PROTECTED_ON_MANUAL_SAVE:
                         if field in previous:
                             item[field] = previous[field]
                         else:

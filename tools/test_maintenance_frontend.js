@@ -10,9 +10,29 @@ const w = b.context;
 const read = b.requests.find(r => r.url.endsWith('/api/repo/maintenance_ui.json'));
 read.getResponseHeader = name => name === 'X-Repo-Revision' ? '7' : null;
 b.reply(read, [{proxy: 'http://192.0.2.1:80', usable: false, aux_reachable: {zcode: false},
-  last_ok: 1234, last_checked_at: 2000, pass_streak: 2, target_profile: 'zai'}]);
+  last_ok: 1234, last_checked_at: 2000, pass_streak: 2, target_profile: 'zai',
+  up_kbps: 320, up_error: 'timeout'}]);
 assert.equal(w.loadRepo()[0].usable, false);
 assert.equal(w.loadRepo()[0].last_ok, 1234);
+// 上行读数由检测链路写入：仓库加载要原样留住它们，否则下一次本地保存就会抹掉。
+assert.equal(w.loadRepo()[0].up_kbps, 320, '加载仓库不能丢上行读数');
+assert.equal(w.loadRepo()[0].up_error, 'timeout', '加载仓库不能丢测速失败原因');
+const compactedReading = w.compactRepoItem({proxy: 'http://192.0.2.9:80', grade: 'A',
+  up_kbps: 320, up_error: 'timeout'});
+assert.equal(compactedReading.up_kbps, 320, '仓库压缩白名单必须保留 up_kbps');
+assert.equal(compactedReading.up_error, 'timeout', '仓库压缩白名单必须保留 up_error');
+assert.equal(w.compactRepoItem({proxy: 'http://192.0.2.9:80', up_kbps: 0}).up_kbps, 0,
+  '0KB/s 是实测读数，不能当成没有读数丢掉');
+const manualReading = w.resultToRepoItem({proxy: 'http://192.0.2.10:80', grade: 'A', up_kbps: 96});
+assert.equal(manualReading.up_kbps, 96, '手动检测结果入库要带读数');
+assert.ok(!('up_error' in manualReading), '没测到/没失败原因就不要写出这个键');
+assert.equal(w.resultToRepoItem({proxy: 'http://192.0.2.10:80', up_error: 'timeout'}).up_error, 'timeout',
+  '有失败原因时要透传');
+// 合并语义：手动检测没测到读数时，不能把仓库里已有的读数抹掉（Object.assign 的易踩点）。
+w.saveRepo([{proxy: 'http://192.0.2.11:80', grade: 'A', up_kbps: 320, up_error: 'timeout'}], {sync: false});
+w.addRepoItems([{proxy: 'http://192.0.2.11:80', grade: 'B'}]);
+assert.equal(w.loadRepo()[0].up_kbps, 320, '无读数的保存不能抹掉已有读数');
+assert.equal(w.loadRepo()[0].grade, 'B', '非测量字段仍按新结果改写');
 w.syncRepoReplace([], 1);
 assert.equal(b.requests.at(-1).body.base_revision, 7);
 b.reply(b.requests.at(-1), {ok: true, count: 0, repo_revision: 8});
