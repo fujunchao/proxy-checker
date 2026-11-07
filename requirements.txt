@@ -1,1 +1,8 @@
-curl_cffi>=0.14.0
+# curl_cffi 是唯一运行时依赖（HTTP 客户端，带浏览器指纹伪装）。
+# 0.16.3 起（本地实测版本）已验证：
+#   1) AsyncSession.stream(..., content=<async generator>) 可用 —— 上行测速的里程碑采样依赖它；
+#      更早的版本对 content= 只保证 str/bytes/IO/可迭代的同步路径，异步生成器上传未经验证；
+#   2) 同一版本没有 response.upload() 回调（见 work/uplink-probe/spec.md §0），
+#      因此 proxy_check.py 走「content= 逐块 yield + 里程碑」而不是 upload 回调。
+# Dockerfile 直接 pip install -r 本文件（不锁版本上限），提高下限只会让镜像装到已验证的版本。
+curl_cffi>=0.16.3

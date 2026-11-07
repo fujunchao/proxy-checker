@@ -237,8 +237,10 @@ def test_required_probe_gate() -> None:
           "ZCode 入口" in str(gated.detail["usable_reason"])
           and "0/2" in str(gated.detail["usable_reason"]),
           gated.detail["usable_reason"])
-    check("gates 只记声明的门槛",
-          gated.detail["gates"] == {"zcode": False}, gated.detail["gates"])
+    # uplink 门禁（v6.7.0 新增）在本用例里为 True：两轮都拿不到上行读数（up_kbps=None），
+    # 按「测不到 ≠ 不达标」的语义放行——否则测速端点一挂就会把整个仓库判成无效。
+    check("gates 记声明的门槛 + 上行门禁（无读数时放行）",
+          gated.detail["gates"] == {"zcode": False, "uplink": True}, gated.detail["gates"])
 
     partial = ScoreAggregator(2, zai).summarize([_gate_round(True), _gate_round(False)])
     check("只有一轮通过 → 门禁不通过", partial.valid is False, partial.detail["gates"])
@@ -387,8 +389,14 @@ def test_retry_and_timeout() -> None:
     production = ProxyCheckEngine(CheckConfig(timeout=12, detect_timeout=8, check_rounds=2))
     zai_budget = production._single_proxy_timeout(2, TARGET_PROFILES["zai"])
     claude_budget = production._single_proxy_timeout(2, TARGET_PROFILES["claude"])
-    # zai = 2 轮 ×(12×2 重试 + 8 协议 + 12 附加探针) + 10
-    check("默认配置下 zai 硬超时 = 98 秒（已计入附加探针）", zai_budget == 98, zai_budget)
+    # zai = 2 轮 ×(12×2 重试 + 8 协议 + 12 附加探针) + 10 + 40 上行测速预算 = 138
+    # 上行只测首轮，但硬超时按单次测速上限整体加一次；不加的话 2 轮检测会被 98s 掐在测速中途。
+    check("默认配置下 zai 硬超时 = 138 秒（附加探针 + 上行测速预算）", zai_budget == 138, zai_budget)
+    uplink_off = ProxyCheckEngine(CheckConfig(timeout=12, detect_timeout=8, check_rounds=2,
+                                              uplink_probe=False))
+    check("关闭上行测速后 zai 硬超时回到 98 秒（回滚路径不变）",
+          uplink_off._single_proxy_timeout(2, TARGET_PROFILES["zai"]) == 98,
+          uplink_off._single_proxy_timeout(2, TARGET_PROFILES["zai"]))
     check("默认配置下 claude 硬超时 = 50 秒（未被重试与附加探针影响）",
           claude_budget == 50, claude_budget)
 
