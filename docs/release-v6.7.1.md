@@ -67,3 +67,20 @@ v6.7.1 只修这一件事，不动探测方法、不改门禁。
 - 基线测量本身占一次额外上行：默认 3×2MiB ≈ 6MiB / 进程启动，之后进程内缓存复用；可用 `UPLINK_BASELINE_KBPS` 直接指定以省掉这笔开销。
 
 具体范围见 [实施方案 v6.7.0](implementation-plan-v6.7.0.md)（本版是其 §「已知限制」的第一条落地）。
+
+## 发布验证记录
+
+- 源码提交：[`28a96f3`](https://github.com/fujunchao/proxy-checker/commit/28a96f308d4f08bf30270c835c4f5080cfb8334c)（工作分支 `codex/v6.7.1-baseline` 合并到 main）。
+- [工作分支完整 CI](https://github.com/fujunchao/proxy-checker/actions/runs/42329653873)：通过。
+- [main 同 SHA 完整 CI](https://github.com/fujunchao/proxy-checker/actions/runs/42329966332)：通过。
+- [标签完整测试与双架构构建](https://github.com/fujunchao/proxy-checker/actions/runs/42330271932)：通过。
+- 镜像核对：`ghcr.io/fujunchao/proxy-checker:v6.7.1` 与 `latest` 同摘要
+  `sha256:44164a28…`，含 `linux/amd64`（`sha256:382a22ac…`）与 `linux/arm64`（`sha256:2dc1ef48…`），
+  两者 `org.opencontainers.image.revision` 均为 `28a96f3`。
+- 部署机实机验证（容器内，只读 `/data`、不重启服务）：
+  自动基线测得 **3703KB/s**（直连读数 3405 / 3703 / 4234，方差在 40% 安全阀内），
+  12 条线上线路的每条读数都带 `baseline_kbps=3703`；该批最高读数为 2925KB/s，未触发截断（符合预期）。
+  曾读出 7142KB/s 的那条线路本次已失效（`not_reachable`），无法在线上复现截断，
+  截断路径由 `tools/test_uplink.py` 第 11 节的合成用例覆盖。
+- 本版仍是**只发布、不部署**：线上容器未重启、未改动任何用户配置与数据。
+
