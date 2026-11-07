@@ -1193,9 +1193,23 @@ function saveRepoRequest(repo,mode,baseCount,callback){
        (revision!==null||res.current_count===0)&&res.count===submitted.length&&
        JSON.stringify(compactRepo(repoCache))===JSON.stringify(submitted)){
       saveRepo(submitted,{sync:false,revision:res.repo_revision});
+      // 服务端会保护 up_kbps/up_error 这类只读测量字段，submitted 里没有它们；
+      // 不回读的话仓库列表要刷新页面才看得到读数（P2）。
+      refreshRepoAfterSave(res.repo_revision);
     }
     callback(err,res);
   });
+}
+
+function refreshRepoAfterSave(savedRevision){
+  // 保存成功后后台回读云端仓库：服务端保护下来的 up_kbps/up_error 只能从服务端拿回来。
+  // 用当前代次做守卫——回读期间用户又改了仓库就放弃回写；silent 保证失败不打扰用户；
+  // sync:false（loadRepoFromServer 内部就是）保证回读不会再触发一次同步，不会打成循环。
+  var expected=repoCacheGeneration;
+  // requireSource:'json' —— 只有 JSON 快照才允许回写。txt 兜底是「只有地址」的占位条目
+  // （grade='?'、没有 latency/ip/usable/up_kbps），拿它覆盖本地缓存等于把读数与元信息一起抹掉。
+  loadRepoFromServer(function(){}, {expectedGeneration:expected, silent:true, replaceEmpty:false,
+    requireSource:'json', fallbackRevision:savedRevision});
 }
 
 function compactRepoItem(p){
@@ -2036,7 +2050,22 @@ function loadRepoFromServer(callback,options){
   var token=getUserToken(),identityEpoch=workspaceEpoch;
   function readRevision(xhr){
     var header=xhr.getResponseHeader?xhr.getResponseHeader('X-Repo-Revision'):null;
-    return header!==null&&header!==''&&Number.isFinite(Number(header))?Number(header):null;
+    if(header!==null&&header!==''&&Number.isFinite(Number(header)))return Number(header);
+    // 保存后的回读带了 fallbackRevision：代理剥掉响应头时不至于把已知版本号清零。
+    return options.fallbackRevision===undefined?null:options.fallbackRevision;
+  }
+  // 统一的回写入口。expectedGeneration / requireSource 只有"保存后回读"才带：
+  // 加载期间用户若又改了仓库（代次变了）就放弃回写，不能让云端旧快照盖掉新编辑；
+  // requireSource='json' 时只认 JSON 快照——txt 兜底只有地址（grade='?'、没有 latency 与上行读数），
+  // 拿它覆盖本地缓存等于把 grade/latency/up_kbps 一起抹成占位值。
+  function applyRepo(repo,count,revision,updateCount,source){
+    if(options.expectedGeneration!==undefined&&options.expectedGeneration!==repoCacheGeneration)return false;
+    if(options.requireSource&&options.requireSource!==source)return false;
+    saveRepo(repo,{sync:false,revision:revision});
+    rememberRepoSync(count,revision);
+    if(updateCount!==false)updateCloudRepoCount();
+    renderRepo();
+    return true;
   }
   function tryLoadJson(t,cb){
     var xhr=new XMLHttpRequest();
@@ -2047,7 +2076,7 @@ function loadRepoFromServer(callback,options){
         try{
           var data=JSON.parse(xhr.responseText);
           var revision=readRevision(xhr);
-          if(Array.isArray(data)&&(data.length>0||revision!==null)){cb(data.length,data,null,revision);return}
+          if(Array.isArray(data)&&(data.length>0||revision!==null)){cb(data.length,data,null,revision,'json');return}
         }catch(e){}
         // Fallback to txt
         tryLoadTxt(t,cb);
@@ -2063,50 +2092,45 @@ function loadRepoFromServer(callback,options){
     xhr.onload=function(){
       if(xhr.status===200){
         var text=xhr.responseText.trim();
-        if(!text){cb(0,[],null,readRevision(xhr));return}
+        if(!text){cb(0,[],null,readRevision(xhr),'empty');return}
         var lines=text.split('\n').filter(function(l){return l.trim()});
         var repo=lines.map(function(p){return {proxy:p,grade:'?',latency:null,ip:null,country:null,ip_type:null,service_reachable:null,api_reachable:null,cf_bypass:false,recommended_use:'generic',target_profile:'generic',target_name:'常规代理检测',added:Date.now()}});
-        cb(repo.length,repo,null,readRevision(xhr));
+        cb(repo.length,repo,null,readRevision(xhr),'txt');
       }else if(xhr.status===404){cb(0)}
       else{cb(0,null,'读取失败')}
     };
     xhr.onerror=function(){cb(0,null,'网络错误')};
     xhr.send();
   }
-  tryLoadJson(token,function(count,repo,err,revision){
+  // 第 5 个参数是数据来源：'json'（完整快照）| 'txt'（只有地址的兜底）| 'empty'（空仓库）。
+  // 既有调用点忽略它即可，行为不变。
+  tryLoadJson(token,function(count,repo,err,revision,source){
     if(identityEpoch!==workspaceEpoch||token!==getUserToken()||!authenticated)return;
     if(err){
-      toast('云端仓库读取失败，保留本地缓存');
+      // 保存后的后台回读是静默的：失败只保留本地缓存，不打扰用户。
+      if(!options.silent)toast('云端仓库读取失败，保留本地缓存');
       if(callback)callback(0);
       return;
     }
     if(count>0){
-          saveRepo(repo,{sync:false,revision:revision});
-          rememberRepoSync(count,revision);
-          updateCloudRepoCount();
-          renderRepo();
-          if(callback)callback(count);
+          applyRepo(repo,count,revision,undefined,source);
+          if(callback)callback(count,source);
     }else{
       if(options.replaceEmpty){
-        saveRepo([],{sync:false,revision:revision});
-        rememberRepoSync(0,revision);
-        renderRepo();
-        if(callback)callback(0);
+        applyRepo([],0,revision,false,source);
+        if(callback)callback(0,source);
         return;
       }
       if(!options.fallbackDefault||token==='default'){
-        if(callback)callback(0);
+        if(callback)callback(0,source);
         return;
       }
-      tryLoadJson('default',function(count2,repo2){
+      tryLoadJson('default',function(count2,repo2,err2,revision2,source2){
         if(count2>0){
-          saveRepo(repo2,{sync:false,revision:null});
-          rememberRepoSync(count2);
-          updateCloudRepoCount();
-          renderRepo();
-          if(callback)callback(count2);
+          applyRepo(repo2,count2,null,undefined,source2);
+          if(callback)callback(count2,source2);
         }else{
-          if(callback)callback(0);
+          if(callback)callback(0,source2);
         }
       });
     }

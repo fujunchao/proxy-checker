@@ -387,11 +387,14 @@ def test_retry_and_timeout() -> None:
     check("异步路径同样尝试 2 次", asyncio.run(async_retry_count()) == 2)
 
     production = ProxyCheckEngine(CheckConfig(timeout=12, detect_timeout=8, check_rounds=2))
-    # v6.7.3：基线改为「批次开始前测」，但本函数在进 session 之前就算超时，那一刻基线必然还没测到，
-    # 所以要把一次基线开销（3×20s 测量 + 6s 等待 = 66s）预留进首条线路的硬超时：138 + 66 = 204。
+    # 基线在批次开始前测，但本函数在进 session 之前就算超时，那一刻基线必然还没测到，
+    # 所以要把一次基线开销预留进首条线路的硬超时。
+    # v6.7.4 起基线有总超时 UPLINK_BASELINE_TOTAL_SECONDS（默认 10s）：
+    #   138 + [min(3×20, 10) + 等锁 12] = 160（v6.7.3 时没有总超时，预留是 3×20+6=66 ⇒ 204）。
     pending_budget = production._single_proxy_timeout(2, TARGET_PROFILES["zai"])
-    check("基线未测得时 zai 硬超时 = 204 秒（含基线预留，v6.7.3）", pending_budget == 204, pending_budget)
+    check("基线未测得时 zai 硬超时 = 160 秒（含基线总超时预留）", pending_budget == 160, pending_budget)
     # 基线测得后回到稳定态预算：2 轮 ×(12×2 重试 + 8 协议 + 12 附加探针) + 10 + 40 上行测速预算 = 138。
+    # 这两个属性在 v6.7.4 起是「落到模块级进程状态」的兼容视图，不再有实例副本。
     production._uplink_baseline_measured = True
     production._uplink_baseline = 3400
     zai_budget = production._single_proxy_timeout(2, TARGET_PROFILES["zai"])
