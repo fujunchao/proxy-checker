@@ -61,3 +61,17 @@ v6.7.3 上线后第二轮独立审核又指出五条，逐条核实**全部成�
   `UPLINK_BASELINE_TOTAL_SECONDS=0` 取消基线总超时（不建议）。
 
 具体范围见 [v6.7.0 实施方案](implementation-plan-v6.7.0.md) 与 [v6.7.3 发布说明](release-v6.7.3.md)。
+
+## 发布验证记录
+
+- 源码提交：[`a9f1e6d`](https://github.com/fujunchao/proxy-checker/commit/a9f1e6dd2ad27ca4b53831b8f4ab5f8ff0f9464b)（工作分支 `codex/v6.7.4-proc-state` 合并到 main）。
+- [工作分支完整 CI](https://github.com/fujunchao/proxy-checker/actions/runs/42365856806)：通过。
+- [main 同 SHA 完整 CI](https://github.com/fujunchao/proxy-checker/actions/runs/42366138076)：通过。
+- [标签完整测试与双架构构建](https://github.com/fujunchao/proxy-checker/actions/runs/42366444162)：通过。
+- 镜像核对：`ghcr.io/fujunchao/proxy-checker:v6.7.4` 与 `latest` 同摘要
+  `sha256:20ec3d93…`，含 `linux/amd64`（`sha256:d1fecc8a…`）与 `linux/arm64`（`sha256:9d5dac23…`），
+  两者 `org.opencontainers.image.revision` 均为 `a9f1e6d`。
+- CI 环境在 v6.7.4 起统一设 `UPLINK_BASELINE_KBPS=-1`：server 启动会在后台预热基线，
+  而每个 import server 的测试进程都会各测一次（MB 级直连流量），CI 不需要这个读数。
+- 本版仍是**只发布、不部署**：线上容器未重启、未改动任何用户配置与数据。
+
