@@ -97,3 +97,17 @@ v6.7.1/v6.7.2 上线后做了一轮独立代码审核，提出五条意见。逐
 - 回滚：`UPLINK_PROBE=0` 关闭整个上行维度；或 `UPLINK_BASELINE_KBPS=-1` 只关截断。
 
 具体范围见 [v6.7.0 实施方案](implementation-plan-v6.7.0.md) 与 [v6.7.1 发布说明](release-v6.7.1.md)。
+
+## 发布验证记录
+
+- 源码提交：[`919253f`](https://github.com/fujunchao/proxy-checker/commit/919253f9f4d1c61f7b65b0ead43271e327216b7f)（工作分支 `codex/v6.7.3-uplink-fixes` 合并到 main）。
+- [工作分支完整 CI](https://github.com/fujunchao/proxy-checker/actions/runs/42360262625)：通过。
+- [main 同 SHA 完整 CI](https://github.com/fujunchao/proxy-checker/actions/runs/42360525296)：通过。
+- [标签完整测试与双架构构建](https://github.com/fujunchao/proxy-checker/actions/runs/42360776498)：通过。
+- 镜像核对：`ghcr.io/fujunchao/proxy-checker:v6.7.3` 与 `latest` 同摘要
+  `sha256:19b20bc2…`，含 `linux/amd64`（`sha256:da3b59e0…`）与 `linux/arm64`（`sha256:699eb3ec…`），
+  两者 `org.opencontainers.image.revision` 均为 `919253f`。
+- 本版仍是**只发布、不部署**：线上容器未重启、未改动任何用户配置与数据。
+
+> 版本号说明：`v6.7.2` 已由另一条并行工作流占用（长内容弹窗限高滚动），本次修复顺延为 `v6.7.3`。
+
