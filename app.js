@@ -1214,7 +1214,9 @@ function compactRepoItem(p){
   if(p.target_name)item.target_name=p.target_name;
   item.added=p.added||Date.now();
   item.updated=p.updated||item.added;
-  ['usable','usable_reason','aux_reachable','protocol_note','last_ok','last_checked_at','pass_streak','fail_count','ip_shared'].forEach(function(k){
+  // up_kbps/up_error 是检测链路写入的只读测量字段：压缩白名单漏了它们，
+  // 「加载仓库 → 本地保存 → 同步云端」这一趟就会把上行读数抹掉（服务端另有保护兜底）。
+  ['usable','usable_reason','aux_reachable','protocol_note','last_ok','last_checked_at','pass_streak','fail_count','ip_shared','up_kbps','up_error'].forEach(function(k){
     if(p[k]!==undefined&&p[k]!==null)item[k]=p[k];
   });
   return item;
@@ -2429,7 +2431,7 @@ function saveRepo(repo,options){
 }
 
 function resultToRepoItem(r){
-  return {
+  var item={
     proxy:r.proxy,
     grade:r.grade||'F',
     latency:r.latency,
@@ -2445,6 +2447,12 @@ function resultToRepoItem(r){
     added:Date.now(),
     updated:Date.now()
   };
+  // 手动检测的结果也要带读数入库（否则点完「检测」后这条线没有 up_kbps）。
+  // 没测到就**不带这个键**：addRepoItems 用 Object.assign 合并，显式写 undefined
+  // 会把仓库里已有的读数抹掉——「测不到」不能当成「没有读数」。
+  if(r.up_kbps!==undefined&&r.up_kbps!==null)item.up_kbps=r.up_kbps;
+  if(r.up_error)item.up_error=r.up_error;
+  return item;
 }
 
 function addRepoItems(items){

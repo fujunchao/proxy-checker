@@ -13,7 +13,7 @@ services:
       args:
         # 设为 "0" 可去掉 Node.js 让镜像更小，代价是 ProxyNova 源无法解析
         WITH_NODE: "1"
-    image: proxy-checker:6.7.2
+    image: proxy-checker:6.7.3
     container_name: proxy-checker
     restart: unless-stopped
 
@@ -41,11 +41,16 @@ services:
       MAX_CONCURRENT: "${MAX_CONCURRENT:-30}"
 
       # --- 上行吞吐测速（up_kbps）---
-      # 这两行是方案 §8 回滚开关的透传点：下面的 environment 是白名单，缺了它们，
+      # 前两行是方案 §8 回滚开关的透传点：下面的 environment 是白名单，缺了它们，
       # .env 里写 UPLINK_PROBE=0 在容器内**完全不生效**（只会静默继续测速、继续烧流量）。
       # UPLINK_PROBE=0 即回滚：zai 档退回「只看可达性」，订阅导出格式不变。
       UPLINK_PROBE: "${UPLINK_PROBE:-1}"
       UPLINK_MIN_KBPS: "${UPLINK_MIN_KBPS:-85}"
+      # 下面三个旋钮 .env.example / 文档里都写了，必须同样透传：文档里写的开关
+      # 在容器里改不动，等于改 .env 是静默无效的（用户审核提的 P2）。
+      UPLINK_PROBE_CONCURRENCY: "${UPLINK_PROBE_CONCURRENCY:-2}"
+      UPLINK_PROBE_WAIT_SECONDS: "${UPLINK_PROBE_WAIT_SECONDS:-3}"
+      UPLINK_BASELINE_KBPS: "${UPLINK_BASELINE_KBPS:-0}"
 
       # --- 运行期状态（指向挂载卷）---
       DATA_DIR: "/data"

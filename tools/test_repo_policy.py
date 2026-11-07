@@ -318,11 +318,13 @@ def test_uplink_fields() -> None:
           server.result_to_repo_item({"proxy": "http://1.2.3.4:8080", "grade": "A", "up_kbps": 0},
                                      existing=ok_item).get("up_kbps") == 0)
 
-    written = server.write_repo_data("t-uplink-test", _repo_uplink_sample())
+    # 注意：sanitize_token 会把含 '-' 的名字回落成 "default"，那样本节和别的用例会共用同一个
+    # 仓库、被既有条目"保护"掉读数（这也正是 UI 保存抹读数的同一个机制）。用下划线隔离。
+    written = server.write_repo_data("t_uplink_test", _repo_uplink_sample())
     stored = {item["proxy"]: item for item in written}
     check("落库后 up_kbps 保存在仓库 JSON 里",
           stored["http://1.1.1.1:8080"].get("up_kbps") == 320, stored["http://1.1.1.1:8080"])
-    check("落库后读回一致", server.read_repo_data("t-uplink-test") == written)
+    check("落库后读回一致", server.read_repo_data("t_uplink_test") == written)
 
 
 def test_uplink_export() -> None:
@@ -378,6 +380,62 @@ def test_compose_passthrough() -> None:
     check("compose 透传 UPLINK_MIN_KBPS",
           'UPLINK_MIN_KBPS: "${UPLINK_MIN_KBPS:-85}"' in compose_text)
     check("compose 注释里写明是回滚透传点", "回滚" in compose_text and "§8" in compose_text)
+    # 文档/.env.example 里写了的旋钮必须能在容器里生效，否则改 .env 是静默无效的（用户审核 P2）。
+    for key, default in (("UPLINK_PROBE_CONCURRENCY", "2"), ("UPLINK_PROBE_WAIT_SECONDS", "3"),
+                         ("UPLINK_BASELINE_KBPS", "0")):
+        expected = key + ': "' + "$" + "{" + key + ":-" + default + '}"'
+        check("compose 透传 " + key, expected in compose_text, expected)
+
+
+def test_save_keeps_uplink_reading() -> None:
+    section("9. UI 保存不抹掉上行读数（repository.save 的保护字段）")
+    import repository
+
+    check("保护字段元组含 up_kbps/up_error",
+          {"up_kbps", "up_error"} <= set(repository.PROTECTED_ON_MANUAL_SAVE),
+          repository.PROTECTED_ON_MANUAL_SAVE)
+
+    token = "t_uplink_save"  # 下划线：含 '-' 的 token 会被 sanitize_token 回落成 "default"
+    proxy = "http://1.2.3.4:8080"
+    other = "http://5.6.7.8:8080"
+    # 种子数据故意让两条各缺一个字段：一条只有读数，一条只有失败原因。
+    server.write_repo_data(token, [
+        {"proxy": proxy, "grade": "A", "usable": True, "up_kbps": 320},
+        {"proxy": other, "grade": "B", "up_error": "timeout"},
+    ])
+    store = server.repo_store(token)
+
+    def save(items, mode="merge"):
+        saved, result = store.save(items, mode, store.summary()["repo_revision"])
+        assert result and result.get("ok"), result
+        return {item["proxy"]: item for item in server.read_repo_data(token)}
+
+    rows = save([{"proxy": proxy, "grade": "B"}, {"proxy": other, "grade": "C"}], "replace")
+    check("replace 整仓重建后 up_kbps 仍在", rows[proxy].get("up_kbps") == 320, rows[proxy])
+    check("replace 整仓重建后 up_error 仍在", rows[other].get("up_error") == "timeout", rows[other])
+    check("replace 不会给另一条伪造读数",
+          "up_error" not in rows[proxy] and "up_kbps" not in rows[other], (rows[proxy], rows[other]))
+    check("非保护字段仍按 incoming 改写（grade A→B / B→C）",
+          rows[proxy].get("grade") == "B" and rows[other].get("grade") == "C", (rows[proxy], rows[other]))
+
+    rows = save([{"proxy": proxy, "grade": "A"}], "merge")
+    check("带 base_revision 的 merge：incoming 缺读数时保留 320", rows[proxy].get("up_kbps") == 320, rows[proxy])
+    rows = save([{"proxy": other, "grade": "D"}], "merge")
+    check("带 base_revision 的 merge：up_error 同样保留", rows[other].get("up_error") == "timeout", rows[other])
+
+    # 以仓库既有值为准是刻意的：读数只由检测链路（publish → convert）写入，
+    # 手动保存带来的「新读数」可能是旧页面缓存里的陈旧值，不能让它覆盖真实测量。
+    rows = save([{"proxy": proxy, "grade": "A", "up_kbps": 50}], "merge")
+    check("incoming 带新读数时仍以仓库既有读数为准", rows[proxy].get("up_kbps") == 320, rows[proxy])
+    rows = save([{"proxy": other, "grade": "D", "up_error": "connect_failed"}], "merge")
+    check("incoming 带新 up_error 时也以仓库既有值为准", rows[other].get("up_error") == "timeout", rows[other])
+
+    rows = save([{"proxy": "http://9.9.9.9:8080", "grade": "A"}], "merge")
+    check("新条目没有读数就不写 up_kbps 键",
+          "up_kbps" not in rows["http://9.9.9.9:8080"], rows["http://9.9.9.9:8080"])
+    rows = save([{"proxy": "http://9.9.9.10:8080", "grade": "A", "up_kbps": 120}], "merge")
+    check("新条目首次入库保留读数（手动检测带读数入库）",
+          rows["http://9.9.9.10:8080"].get("up_kbps") == 120, rows["http://9.9.9.10:8080"])
 
 
 def main() -> None:
@@ -392,6 +450,7 @@ def main() -> None:
         test_uplink_fields()
         test_uplink_export()
         test_compose_passthrough()
+        test_save_keeps_uplink_reading()
     finally:
         shutil.rmtree(_TMP, ignore_errors=True)
 

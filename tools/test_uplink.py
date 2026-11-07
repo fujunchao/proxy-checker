@@ -7,7 +7,7 @@
   4) 进程内 TTL 缓存（D3）：TTL 内命中不搬 body；TTL=0 关闭缓存
   5) 成本闸门（D5）：服务不可达的线路不烧 2MiB
   6) 公共结果透传：up_kbps / up_error（成功条目与失败条目都要有这两个键）
-  7) 硬超时预算：启用测速后变大且 <=180，关闭时回到原值
+  7) 硬超时预算：启用测速后变大且 <=240，关闭时回到原值
   8) 方向验证：本地限速 HTTP CONNECT 代理（令牌桶，默认 200KB/s），
      让 _probe_uplink_async 经它打 https://speed.cloudflare.com/__up，
      断言读数落在 [0.5x, 3x]。无外网则打印 SKIP，不判失败。
@@ -18,6 +18,12 @@
      人工基线/关闭截断、基线自身不被截断、截断不改变门禁结论、同步路径同语义。
   12) 先连通再测速：required_probes 不通过时一个字节都不发、门禁通过才测、
      非测速档位执行次序不变、同步路径同语义。
+  13) 门禁语义（v6.7.3 P1）：只看「有读数的轮次」是否都达标；只有一轮测到 400KB/s 要判通过，
+      usable_reason 用最小读数并注明测到轮数。
+  14) 基线在批次开始前测（v6.7.3 P1）：check_many_async / check_proxy_full* 入口先 ensure，
+     已缓存不重复测。
+  15) 硬超时双保险（v6.7.3 P1）：基线尚未测得时额外预留一次基线开销，基线测得后回到 138。
+  16) 并发配额是进程级的（v6.7.3 P2）：两个事件循环/两个线程合计不超过上限。
 
 用法：
     python tools/test_uplink.py
@@ -131,21 +137,34 @@ class FakeSession:
     """只实现 stream() 的替身 session；计数用来断言「搬了几次 body」和在飞并发数。"""
 
     def __init__(self, status_code: int = 200, per_chunk_delay: float = 0.002,
-                 tracker: Optional[Dict[str, int]] = None):
+                 tracker: Optional[Dict[str, int]] = None,
+                 tracker_lock: Optional[threading.Lock] = None):
         self.status_code = status_code
         self.per_chunk_delay = per_chunk_delay
         self.tracker = tracker
+        self.tracker_lock = tracker_lock
         self.calls = 0
         self.last_kwargs: Dict[str, object] = {}
 
     def _enter(self) -> None:
-        if self.tracker is not None:
-            self.tracker["now"] += 1
-            self.tracker["max"] = max(self.tracker["max"], self.tracker["now"])
+        if self.tracker is None:
+            return
+        if self.tracker_lock is not None:
+            with self.tracker_lock:
+                self.tracker["now"] += 1
+                self.tracker["max"] = max(self.tracker["max"], self.tracker["now"])
+            return
+        self.tracker["now"] += 1
+        self.tracker["max"] = max(self.tracker["max"], self.tracker["now"])
 
     def _leave(self) -> None:
-        if self.tracker is not None:
-            self.tracker["now"] -= 1
+        if self.tracker is None:
+            return
+        if self.tracker_lock is not None:
+            with self.tracker_lock:
+                self.tracker["now"] -= 1
+            return
+        self.tracker["now"] -= 1
 
     def stream(self, method: str, url: str, **kwargs: object) -> FakeStream:
         self.calls += 1
@@ -293,9 +312,9 @@ def test_gate() -> None:
           "上行" in str(slow.detail["usable_reason"])
           and "不可达" not in str(slow.detail["usable_reason"]),
           slow.detail["usable_reason"])
-    check("慢线 → usable_reason 带上中位读数与门槛",
-          "42KB/s" in str(slow.detail["usable_reason"])
-          and f"门槛 {UPLINK_MIN_KBPS}KB/s" in str(slow.detail["usable_reason"]),
+    check("慢线 → usable_reason 用最小读数 + 门槛 + 测到轮数",
+          str(slow.detail["usable_reason"])
+          == f"上行 40KB/s 低于门槛 {UPLINK_MIN_KBPS}KB/s（2/2 轮测到）",
           slow.detail["usable_reason"])
     check("慢线 → grade 不因上行被改（仍为 A，供人工参考）", slow.grade == "A", slow.grade)
     check("detail 记录 uplink_passed/measured/min_kbps/kbps",
@@ -325,11 +344,16 @@ def test_gate() -> None:
     check("measured==0 → valid 保持 True", unmeasured.valid is True, unmeasured.valid)
     check("measured==0 → detail 记 uplink_measured=0", unmeasured.detail.get("uplink_measured") == 0)
 
+    # v6.7.3 修正：只看「有读数的轮次」是否都达标——1/2 轮测到 500 属于合格，
+    # 旧实现会判不通过（把 busy 跳过当成慢线），详见第 13 节。
     partial = ScoreAggregator(2, ZAI).summarize([_zai_round(500), _zai_round(None)])
-    check("有读数就必须全轮达标（1/2 不算过）",
-          partial.detail["gates"].get("uplink") is False, partial.detail["gates"])
-    check("部分测到 → usable_reason 说明未测到的那轮口径",
-          "上行" in str(partial.detail["usable_reason"]), partial.detail["usable_reason"])
+    check("部分测到（1/2）且达标 → 通过（v6.7.3 修正）",
+          partial.detail["gates"].get("uplink") is True, partial.detail["gates"])
+    slow_partial = ScoreAggregator(2, ZAI).summarize([_zai_round(40), _zai_round(None)])
+    check("部分测到（1/2）但不达标 → 不通过，文案带测到轮数",
+          slow_partial.detail["gates"].get("uplink") is False
+          and "（1/2 轮测到）" in str(slow_partial.detail["usable_reason"]),
+          slow_partial.detail["usable_reason"])
 
     err_round = _zai_round(None)
     err_round.up_error = "连接超时"
@@ -575,10 +599,10 @@ def test_public_result() -> None:
     # 直接验证 _usable_reason 的两种上行文案
     reason_no_reading = _usable_reason(ZAI, {"uplink": False}, {}, 2, None, UPLINK_MIN_KBPS)
     check("无读数时文案为「上行未测到」",
-          reason_no_reading == f"上行未测到（低于门槛 {UPLINK_MIN_KBPS}KB/s）", reason_no_reading)
-    reason_slow = _usable_reason(ZAI, {"uplink": False}, {}, 2, 42, UPLINK_MIN_KBPS)
-    check("有读数时文案带读数与门槛",
-          reason_slow == f"上行 42KB/s 低于门槛 {UPLINK_MIN_KBPS}KB/s", reason_slow)
+          reason_no_reading == f"上行未测到（门槛 {UPLINK_MIN_KBPS}KB/s）", reason_no_reading)
+    reason_slow = _usable_reason(ZAI, {"uplink": False}, {}, 2, 42, UPLINK_MIN_KBPS, 1)
+    check("有读数时文案带最小读数、门槛与测到轮数",
+          reason_slow == f"上行 42KB/s 低于门槛 {UPLINK_MIN_KBPS}KB/s（1/2 轮测到）", reason_slow)
     reason_aux = _usable_reason(ZAI, {"zcode": False}, {"zcode": 0}, 2, None, UPLINK_MIN_KBPS)
     check("既有 aux 文案逐字不变", reason_aux == "ZCode 入口 不可达(0/2)", reason_aux)
 
@@ -587,9 +611,12 @@ def test_public_result() -> None:
 def test_timeout_budget() -> None:
     section("7. 硬超时预算（启用测速后必须变大）")
     prod = ProxyCheckEngine(CheckConfig(timeout=12, detect_timeout=8, check_rounds=2))
+    # 基线已测得的稳定态（「基线尚未测得」要多预留一次基线开销，见第 15 节）。
+    prod._uplink_baseline_measured = True
+    prod._uplink_baseline = 3400
     zai_on = prod._single_proxy_timeout(2, ZAI)
-    check("zai 启用测速 → 98 + 40 = 138", zai_on == 138, zai_on)
-    check("硬超时上限为 180", prod._single_proxy_timeout(10, ZAI) == 180,
+    check("zai 启用测速（基线已测得）→ 98 + 40 = 138", zai_on == 138, zai_on)
+    check("硬超时上限为 240", prod._single_proxy_timeout(10, ZAI) == 240,
           prod._single_proxy_timeout(10, ZAI))
     check("claude（无测速）仍为 50（零回归）", prod._single_proxy_timeout(2, TARGET_PROFILES["claude"]) == 50,
           prod._single_proxy_timeout(2, TARGET_PROFILES["claude"]))
@@ -609,6 +636,8 @@ def test_timeout_budget() -> None:
 
     custom_budget = ProxyCheckEngine(CheckConfig(timeout=12, detect_timeout=8, check_rounds=2,
                                                  uplink_budget=25))
+    custom_budget._uplink_baseline_measured = True
+    custom_budget._uplink_baseline = 3400
     check("uplink_budget 可配置（98 + 25 = 123）",
           custom_budget._single_proxy_timeout(2, ZAI) == 123,
           custom_budget._single_proxy_timeout(2, ZAI))
@@ -1307,6 +1336,185 @@ def test_precheck_cost_gate() -> None:
           (uplink_calls["n"], sync_ok.up_kbps))
 
 
+# ── 13. 门禁语义：部分轮次没测到不算不达标（v6.7.3 P1）────────────────────
+def test_gate_partial_measurement() -> None:
+    section("13. 门禁语义：只看「有读数的轮次」是否都达标")
+    # 旧实现要求 uplink_passed == rounds：首轮 busy 跳过、次轮测到 400 → 1 != 2 判失败。
+    partial_fast = ScoreAggregator(2, ZAI).summarize([_zai_round(None), _zai_round(400)])
+    check("只有一轮测到 400KB/s → 门禁通过（旧实现会判失败）",
+          partial_fast.detail["gates"].get("uplink") is True, partial_fast.detail["gates"])
+    check("只有一轮测到 400KB/s → 线路仍然 usable", partial_fast.valid is True, partial_fast.valid)
+
+    partial_slow = ScoreAggregator(2, ZAI).summarize([_zai_round(40), _zai_round(None)])
+    check("只有一轮测到 40KB/s → 门禁不通过",
+          partial_slow.detail["gates"].get("uplink") is False, partial_slow.detail["gates"])
+    check("文案用最小读数并注明测到轮数",
+          partial_slow.detail["usable_reason"] == f"上行 40KB/s 低于门槛 {UPLINK_MIN_KBPS}KB/s（1/2 轮测到）",
+          partial_slow.detail["usable_reason"])
+
+    none_measured = ScoreAggregator(2, ZAI).summarize([_zai_round(None), _zai_round(None)])
+    check("两轮都没测到 → 放行（D4）",
+          none_measured.detail["gates"].get("uplink") is True, none_measured.detail["gates"])
+
+    both_fast = ScoreAggregator(2, ZAI).summarize([_zai_round(400), _zai_round(500)])
+    check("两轮都测到且都达标 → 通过",
+          both_fast.detail["gates"].get("uplink") is True, both_fast.detail["gates"])
+
+    mixed = ScoreAggregator(2, ZAI).summarize([_zai_round(400), _zai_round(40)])
+    check("两轮都测到但有一轮 40KB/s → 不通过",
+          mixed.detail["gates"].get("uplink") is False, mixed.detail["gates"])
+    check("文案用最小读数 40 而不是中位 220",
+          "上行 40KB/s" in str(mixed.detail["usable_reason"]),
+          mixed.detail["usable_reason"])
+    check("detail 补 uplink_min（最小读数）", mixed.detail.get("uplink_min") == 40,
+          mixed.detail.get("uplink_min"))
+    check("混合场景文案注明测到轮数 2/2",
+          "（2/2 轮测到）" in str(mixed.detail["usable_reason"]),
+          mixed.detail["usable_reason"])
+
+
+# ── 14. 基线在批次开始前测（v6.7.3 P1）────────────────────────────────────
+def test_baseline_before_batch() -> None:
+    section("14. 宿主基线在批次开始前测（不占用任何一条线路的硬超时）")
+    original = (proxy_check.UPLINK_BASELINE_KBPS, proxy_check.UPLINK_BASELINE_RUNS,
+                proxy_check.UPLINK_BASELINE_STABILITY)
+    try:
+        proxy_check.UPLINK_BASELINE_KBPS = 0
+        proxy_check.UPLINK_BASELINE_RUNS = 3
+        proxy_check.UPLINK_BASELINE_STABILITY = 40
+
+        # 14.1 check_many_async：基线直连测量发生在第一条线路被检测之前
+        engine = make_engine()
+        order: List[str] = []
+        calls = _install_fake_transfer(engine, line_kbps=2000, baseline_kbps=[3400, 3430, 3460])
+
+        async def fake_full(proxy, session, stop_event=None, rounds=None, target_profile=None):
+            order.append("line:" + proxy)
+            return {"proxy": proxy, "original": proxy, "valid": False, "grade": "F"}
+
+        engine.check_proxy_full_async = fake_full  # type: ignore[method-assign]
+        seen: List[Dict[str, object]] = []
+        asyncio.run(engine.check_many_async(
+            ["http://10.20.0.1:8080", "http://10.20.0.2:8080"], None, 1, 1,
+            lambda result: seen.append(result), "zai",
+        ))
+        check("check_many_async：基线测完才开始第一条线路",
+              order and order[0].startswith("line:") and calls["direct"] == 3,
+              {"order": order, "direct": calls["direct"]})
+        check("check_many_async：两条线路都跑到了", len(order) == 2, order)
+
+        # 14.2 check_proxy_full_async 入口同样先测基线
+        engine2 = make_engine()
+        order2: List[str] = []
+        calls2 = _install_fake_transfer(engine2, line_kbps=2000, baseline_kbps=[3400, 3430, 3460])
+
+        async def fake_once(proxy_str, profile, session, stop_event=None, timeout=None,
+                            ip_hint=None, uplink_hint=None):
+            order2.append("once")
+            return RoundResult(service_reachable=True, aux={"zcode": True}, status_code=200,
+                               ip="1.2.3.4", latency=100, up_kbps=2000)
+
+        engine2.check_once_async = fake_once  # type: ignore[method-assign]
+        public = asyncio.run(engine2.check_proxy_full_async(
+            "http://10.20.0.3:8080", FakeSession(), None, 2, "zai"))
+        check("check_proxy_full_async：基线测完才开始第一轮",
+              calls2["direct"] == 3 and order2 == ["once", "once"],
+              {"direct": calls2["direct"], "order": order2})
+        check("check_proxy_full_async：结果仍然可用", public is not None and public.get("up_kbps") == 2000,
+              (public or {}).get("up_kbps"))
+
+        # 14.3 基线已缓存 → 不再重复测
+        asyncio.run(engine2.check_proxy_full_async(
+            "http://10.20.0.4:8080", FakeSession(), None, 1, "zai"))
+        check("基线已缓存时不重复测", calls2["direct"] == 3, calls2["direct"])
+
+        # 14.4 同步入口同样先测基线
+        engine3 = make_engine()
+        calls3 = _install_fake_transfer(engine3, line_kbps=2000, baseline_kbps=[3400, 3430, 3460],
+                                        sync=True)
+
+        def fake_once_sync(proxy_str, profile, stop_event=None, timeout=None, ip_hint=None,
+                           uplink_hint=None):
+            return RoundResult(service_reachable=True, aux={"zcode": True}, status_code=200,
+                               ip="1.2.3.4", latency=100, up_kbps=2000)
+
+        engine3.check_once = fake_once_sync  # type: ignore[method-assign]
+        engine3.check_proxy_full("http://10.20.0.5:8080", None, 1, "zai")
+        check("check_proxy_full（同步）：入口先测基线", calls3["direct"] == 3, calls3["direct"])
+    finally:
+        (proxy_check.UPLINK_BASELINE_KBPS, proxy_check.UPLINK_BASELINE_RUNS,
+         proxy_check.UPLINK_BASELINE_STABILITY) = original
+
+
+# ── 15. 硬超时给「基线尚未测得」留双保险（v6.7.3 P1）──────────────────────
+def test_timeout_includes_baseline() -> None:
+    section("15. 硬超时双保险：基线尚未测得时额外加一次基线开销")
+    engine = make_engine(timeout=12, detect_timeout=8, check_rounds=2)
+    fresh = engine._single_proxy_timeout(2, ZAI)
+    baseline_cost = (proxy_check.UPLINK_BASELINE_RUNS * engine._baseline_transfer_budget()
+                     + int(engine._baseline_wait_seconds()))
+    check("基线未测得 → 硬超时 ≥ 138 + 基线开销", fresh >= 138 + baseline_cost,
+          {"budget": fresh, "baseline_cost": baseline_cost})
+    check("基线未测得 → 硬超时 ≤ 240 上限", fresh <= 240, fresh)
+
+    engine._uplink_baseline_measured = True
+    engine._uplink_baseline = 3400
+    check("基线已测得 → 回到 138", engine._single_proxy_timeout(2, ZAI) == 138,
+          engine._single_proxy_timeout(2, ZAI))
+    check("claude（无测速）不受影响", engine._single_proxy_timeout(2, TARGET_PROFILES["claude"]) == 50,
+          engine._single_proxy_timeout(2, TARGET_PROFILES["claude"]))
+
+
+# ── 16. 并发配额是进程级的（v6.7.3 P2）───────────────────────────────────
+def test_process_level_quota() -> None:
+    section("16. 并发配额是进程级的：跨事件循环/跨线程共享")
+    original = (proxy_check.UPLINK_PROBE_CONCURRENCY, proxy_check.UPLINK_PROBE_WAIT_SECONDS)
+    try:
+        proxy_check.UPLINK_PROBE_CONCURRENCY = 2
+        proxy_check.UPLINK_PROBE_WAIT_SECONDS = 5
+        engine = make_engine()
+        tracker = {"now": 0, "max": 0}
+        tracker_lock = threading.Lock()
+        gate_ids: List[int] = []
+        gate_ids_lock = threading.Lock()
+
+        async def one_loop(tag: int) -> None:
+            gate = engine._uplink_gate_for_thread()
+            with gate_ids_lock:
+                gate_ids.append(id(gate))
+            sessions = [FakeSession(per_chunk_delay=0.02, tracker=tracker, tracker_lock=tracker_lock)
+                        for _ in range(2)]
+            results = [RoundResult(service_reachable=True) for _ in range(2)]
+            await asyncio.gather(*[
+                engine._probe_uplink_async(sessions[i], results[i], ZAI,
+                                           {"https": "http://10.16.%d.%d:8080" % (tag, i)})
+                for i in range(2)
+            ])
+
+        def run_loop(tag: int) -> None:
+            asyncio.run(one_loop(tag))
+
+        threads = [threading.Thread(target=run_loop, args=(tag,)) for tag in (1, 2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        check("两个事件循环合计在飞测速 ≤ 上限 2（旧 per-loop 实现会到 4）",
+              tracker["max"] <= 2, tracker["max"])
+        check("跨事件循环用的是同一把进程级配额",
+              len(set(gate_ids)) == 1 and 0 not in gate_ids, gate_ids)
+
+        # 单跑一遍仍然正常出读数（配额被正确归还）
+        after = FakeSession(per_chunk_delay=0.001)
+        after_result = RoundResult(service_reachable=True)
+        asyncio.run(engine._probe_uplink_async(after, after_result, ZAI,
+                                               {"https": "http://10.16.9.9:8080"}))
+        check("两个线程跑完后配额已归还", after_result.up_kbps is not None, after_result.up_error)
+    finally:
+        (proxy_check.UPLINK_PROBE_CONCURRENCY, proxy_check.UPLINK_PROBE_WAIT_SECONDS) = original
+
+
 def main() -> None:
     print("上行吞吐（up_kbps）自检开始")
     print(f"  UPLINK_PROBE={os.environ.get('UPLINK_PROBE')}  "
@@ -1324,6 +1532,10 @@ def main() -> None:
     test_concurrency_gate()
     test_baseline_saturation()
     test_precheck_cost_gate()
+    test_gate_partial_measurement()
+    test_baseline_before_batch()
+    test_timeout_includes_baseline()
+    test_process_level_quota()
 
     total = len(PASSED) + len(FAILED)
     print(f"\n结果: {len(PASSED)}/{total} 通过，跳过 {len(SKIPPED)} 项")
