@@ -98,6 +98,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: 验证 Compose 基线总超时透传
+        run: |
+          for value in 0 7; do
+            UPLINK_BASELINE_TOTAL_SECONDS="$value" docker compose --env-file .env.example config --format json > /tmp/proxy-checker-compose.json
+            python -c 'import json, sys; config = json.load(open("/tmp/proxy-checker-compose.json")); assert str(config["services"]["proxy-checker"]["environment"]["UPLINK_BASELINE_TOTAL_SECONDS"]) == sys.argv[1]' "$value"
+          done
       - uses: docker/setup-buildx-action@v3
       - name: 构建待测试镜像（不发布）
         uses: docker/build-push-action@v6

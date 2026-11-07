@@ -387,7 +387,7 @@ def test_compose_passthrough() -> None:
     check("compose 注释里写明是回滚透传点", "回滚" in compose_text and "§8" in compose_text)
     # 文档/.env.example 里写了的旋钮必须能在容器里生效，否则改 .env 是静默无效的（用户审核 P2）。
     for key, default in (("UPLINK_PROBE_CONCURRENCY", "2"), ("UPLINK_PROBE_WAIT_SECONDS", "3"),
-                         ("UPLINK_BASELINE_KBPS", "0")):
+                         ("UPLINK_BASELINE_KBPS", "0"), ("UPLINK_BASELINE_TOTAL_SECONDS", "10")):
         expected = key + ': "' + "$" + "{" + key + ":-" + default + '}"'
         check("compose 透传 " + key, expected in compose_text, expected)
 
