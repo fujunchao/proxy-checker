@@ -10,7 +10,7 @@ Users batch-check free proxy lists for general HTTPS access and AI service reach
 
 ## Product Purpose
 
-Proxy Checker v6.7.0 is a self-hosted-first free proxy checker, repository maintainer, and scheduled automation tool. It pulls from continuously updated public proxy sources, deduplicates large batches, checks HTTP, HTTPS, SOCKS4, SOCKS5, and SOCKS5H proxies, and helps users save, filter, re-check, export, sync, schedule, and share usable proxies through stable TXT / JSON repository links.
+Proxy Checker v6.7.1 is a self-hosted-first free proxy checker, repository maintainer, and scheduled automation tool. It pulls from continuously updated public proxy sources, deduplicates large batches, checks HTTP, HTTPS, SOCKS4, SOCKS5, and SOCKS5H proxies, and helps users save, filter, re-check, export, sync, schedule, and share usable proxies through stable TXT / JSON repository links.
 
 The product supports six target profiles: generic HTTPS proxy checking, OpenAI, Grok, Gemini, Claude, and Z.AI (z.ai / chat.z.ai, the api.z.ai API domain, and the ZCode plan entry zcode.z.ai). Results should explain practical network usefulness: base reachability, service homepage reachability, API-domain reachability, audit-probe reachability where a profile declares one, Cloudflare status where relevant, exit IP, country, IP type, grade, and recommended use.
 
@@ -52,7 +52,7 @@ Prefer complete, low-friction workflows that do not require manual stitching. Ke
 
 ## Release Context
 
-v6.7.0 is the current public GitHub release line. It keeps the v6.0 general-purpose proxy checker foundation: target profiles for generic/OpenAI/Grok/Gemini/Claude/Z.AI, registration-page detection removal, practical usefulness labels, exit IP/country/IP-type reporting, dynamic proxy source aggregation at 1W+ scale, repository filtering and cloud sync, refresh-safe detection, visible row actions, password-gated same-origin app shell, global settings, run logs, timezone-aware backend auto tasks, automatic repository maintenance, per-profile audit probes with usability gates, filtered subscription links, stability and shared-exit tracking, serverless degradation messaging, smoke coverage, container deployment (Dockerfile, Compose, multi-arch GHCR images), and release documentation.
+v6.7.1 is the current public GitHub release line. It keeps the v6.0 general-purpose proxy checker foundation: target profiles for generic/OpenAI/Grok/Gemini/Claude/Z.AI, registration-page detection removal, practical usefulness labels, exit IP/country/IP-type reporting, dynamic proxy source aggregation at 1W+ scale, repository filtering and cloud sync, refresh-safe detection, visible row actions, password-gated same-origin app shell, global settings, run logs, timezone-aware backend auto tasks, automatic repository maintenance, per-profile audit probes with usability gates, filtered subscription links, stability and shared-exit tracking, serverless degradation messaging, smoke coverage, container deployment (Dockerfile, Compose, multi-arch GHCR images), and release documentation.
 
 v6.3 focuses on long-running task reliability and empty-repository correctness. Large checks use bounded workers instead of creating every asynchronous task at once, individual proxy checks have a hard timeout, stop requests cancel pending workers, and auto summaries retain the last progress timestamp. Restoring an empty cloud repository now clears stale browser data and never falls back to another user's legacy default repository.
 v6.5 adds a Z.AI target profile for checking whether a proxy can reach z.ai (which redirects to chat.z.ai) and the api.z.ai API domain, and unifies the documented version line to v6.5. Because z.ai sits behind Alibaba Cloud ESA rather than Cloudflare, challenge pages observed through a proxy are treated as proxy-side interception instead of reachability. The profile retries once inside a round and appends a profile-level hint to failures where a response was received but the criteria were not met; the per-proxy hard timeout budget accounts for that retry. Container deployment shipped in v6.4 and is documented in DOCKER.md.
@@ -71,3 +71,5 @@ v6.6.4 为持续维护增加每来源独立队列、小批轮转、连续复测�
 v6.6.5 提升已有并发的利用率：跨源待检去重并保留归属，过滤后从其他缓存补量，完整检测节点再次到期后恢复最老优先选批；新增本批多来源与选批统计。并发、轮数、门槛、force/skip 以及增量发布语义不变，不自动部署。
 
 v6.7.0 为 Z.AI / ZCode 档补上第二个维度：上行吞吐 `up_kbps`（独立测速端点、≥2MiB 载荷、只统计跳过前 128KB 的稳态区间；每线路只测首轮、6 小时节流、仅测可达线路）。新增与 `required_probes` 独立的上行门禁与订阅过滤 `?up_min=`，`up_kbps`/`up_error` 随结果与仓库条目输出供下游排序。其余档位行为逐字不变，`UPLINK_PROBE=0` 可一键回滚，不自动部署。
+
+v6.7.1 给上行读数加上「宿主机直连基线」饱和截断：读数超过本机可达上限时记录为该上限并标 `saturated`（原始值留在 `raw_kbps`），避免把内核缓冲填充速率当成线速写进仓库并缓存。基线用同一套仪器直连测 3 次取中位，三次偏离中位超过 40% 即判不稳定并**放弃截断**（宁可留可疑高值，也不能用被并发压低的基线截掉合法快线）。截断只降不升，不改变门禁方向。
