@@ -80,3 +80,14 @@ Chromium 1920×869 复现（真实 `index.html`、stub 掉 `post`、注入线上
 
 ## 发布验证记录
 
+- 源码提交：[`5c707be`](https://github.com/fujunchao/proxy-checker/commit/5c707bebdacd6838f3dc684e054cbb4c72ed065a)（工作分支 `codex/v6.7.2-modal-ui` 合并到 main）。
+- [工作分支完整 CI](https://github.com/fujunchao/proxy-checker/actions/runs/42336023138)：通过（后端、前端、完整冒烟 + Docker isolated/fixed）。
+- [main 同 SHA 完整 CI](https://github.com/fujunchao/proxy-checker/actions/runs/42336150888)：通过。
+- [标签完整测试与双架构构建](https://github.com/fujunchao/proxy-checker/actions/runs/42336288699)：通过（tests 三个 job + build 全部 success）。
+- 镜像核对：`ghcr.io/fujunchao/proxy-checker:v6.7.2`、`latest`、`sha-5c707be` 指向同一个 manifest list
+  `sha256:b0dacf7d6756cb22be6e591d78749f28bb6ba2b8869aac015149c56bfa42a4e1`；
+  构建产物含两个单架构清单（`sha256:3a7b8128b00da8cab6a6b4b3d56fcba8db06fcdbf2e8bb20468c50451f9d513f`、
+  `sha256:f05f743a63f5152ef950fe2d252a12f0b4b32090d985fd4b2656d67b353958d4`），
+  构建 provenance 覆盖 `linux/amd64` 与 `linux/arm64`，`org.opencontainers.image.revision` 为 `5c707be`。
+- 本版仍是**只发布、不部署**：线上容器未重启、未改动任何用户配置与数据；升级只需拉取新镜像并重建容器。
+
