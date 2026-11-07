@@ -31,6 +31,11 @@ _COPY = os.path.join(_TMP, "proxy-checker")
 shutil.copytree(BASE_DIR, _COPY, ignore=_SKIP)
 sys.path.insert(0, _COPY)
 
+# server 在 import 时就会起 daemon 线程预热宿主机直连基线（v6.7.4）。
+# 测试进程不需要这个读数，也别为此往 speed.cloudflare.com 传几 MB：
+# 负值 = 关闭基线截断，warm_uplink_baseline_async 会立即返回。
+os.environ.setdefault("UPLINK_BASELINE_KBPS", "-1")
+
 import server  # noqa: E402
 
 PASSED: list = []
@@ -438,6 +443,66 @@ def test_save_keeps_uplink_reading() -> None:
           rows["http://9.9.9.10:8080"].get("up_kbps") == 120, rows["http://9.9.9.10:8080"])
 
 
+def test_uplink_baseline_warmup() -> None:
+    section("10. 基线预热在批次之外（启动 / 引擎重建各一次，失败不影响启动）")
+    import re
+    import types
+
+    with open(os.path.join(BASE_DIR, "server.py"), encoding="utf-8") as handle:
+        src = handle.read()
+
+    check("server 提供预热入口", "def start_uplink_baseline_warmup(" in src)
+    check("预热跑在 daemon 线程里的一次 asyncio.run",
+          "asyncio.run(warm())" in src and 'name="uplink-baseline-warmup"' in src)
+    check("预热调用点恰好两处（进程启动 + 引擎重建）",
+          len(re.findall(r"^[ \t]*start_uplink_baseline_warmup\(", src, re.M)) == 2,
+          re.findall(r"^[ \t]*start_uplink_baseline_warmup\(.*", src, re.M))
+    check("启动处的预热在建引擎之后",
+          src.index('start_uplink_baseline_warmup("进程启动")') > src.index("check_engine = ProxyCheckEngine("))
+    settings_body = src[src.index("def apply_runtime_settings("):src.index("def get_int_from(")]
+    check("重建引擎之后也预热一次",
+          settings_body.index("start_uplink_baseline_warmup(") > settings_body.index("check_engine = ProxyCheckEngine("))
+
+    class FakeEngine:
+        def __init__(self, fail=False):
+            self.calls = 0
+            self.fail = fail
+
+        async def warm_uplink_baseline_async(self):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("boom")
+
+    original_engine = server.check_engine
+    original_flag = server.UPLINK_PROBE_CFG
+    try:
+        server.UPLINK_PROBE_CFG = True
+        fake = FakeEngine()
+        server.check_engine = fake
+        thread = server.start_uplink_baseline_warmup("单元测试")
+        check("返回后台守护线程", thread is not None and thread.daemon is True,
+              getattr(thread, "daemon", None))
+        thread.join(5)
+        check("预热确实被调用一次", fake.calls == 1, fake.calls)
+
+        boom = FakeEngine(fail=True)
+        server.check_engine = boom
+        failed = server.start_uplink_baseline_warmup("单元测试-失败")
+        failed.join(5)
+        check("预热失败不抛异常、线程正常结束", not failed.is_alive() and boom.calls == 1, boom.calls)
+
+        server.check_engine = types.SimpleNamespace()
+        check("引擎没有预热入口时静默跳过（core 未落地也不崩）",
+              server.start_uplink_baseline_warmup("无入口") is None)
+
+        server.UPLINK_PROBE_CFG = False
+        check("上行总开关关闭时不预热（不白烧直连流量）",
+              server.start_uplink_baseline_warmup("总开关关闭") is None)
+    finally:
+        server.check_engine = original_engine
+        server.UPLINK_PROBE_CFG = original_flag
+
+
 def main() -> None:
     print("仓库入库口径自检开始")
     try:
@@ -451,6 +516,7 @@ def main() -> None:
         test_uplink_export()
         test_compose_passthrough()
         test_save_keeps_uplink_reading()
+        test_uplink_baseline_warmup()
     finally:
         shutil.rmtree(_TMP, ignore_errors=True)
 

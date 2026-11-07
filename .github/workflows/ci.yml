@@ -23,6 +23,10 @@ jobs:
     env:
       RUN_FULL_SMOKE: '1'
       PYTHONUNBUFFERED: '1'
+      # v6.7.4：server 启动会在后台预热「宿主直连上行基线」。CI 不需要这个读数，
+      # 而每个 import server 的测试进程都会各测一次（MB 级直连流量），统一关掉。
+      # tools/test_uplink.py 内部会自己把它打开来测基线逻辑。
+      UPLINK_BASELINE_KBPS: '-1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

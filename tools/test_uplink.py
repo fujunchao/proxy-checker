@@ -24,6 +24,8 @@
      已缓存不重复测。
   15) 硬超时双保险（v6.7.3 P1）：基线尚未测得时额外预留一次基线开销，基线测得后回到 138。
   16) 并发配额是进程级的（v6.7.3 P2）：两个事件循环/两个线程合计不超过上限。
+  17) 基线与配额提到模块级（v6.7.4）：两个引擎实例共享同一把配额闸与同一份基线、
+     基线整体硬超时、失败不重试、停止信号在轮次间生效、拿不到配额就不截断。
 
 用法：
     python tools/test_uplink.py
@@ -99,6 +101,15 @@ def check(name: str, condition: Any, detail: Any = "") -> None:
 def skip(name: str, reason: str) -> None:
     SKIPPED.append(name)
     print(f"  SKIP  {name}（{reason}）")
+
+
+def run_section(fn) -> None:
+    """跑一节用例：单节抛异常只记一条 FAIL，不中断其余小节（红线用例也能一眼看出）。"""
+    try:
+        fn()
+    except Exception as exc:  # noqa: BLE001
+        FAILED.append(f"{fn.__name__} 抛异常")
+        print(f"  FAIL  {fn.__name__} 抛异常: {type(exc).__name__}: {exc}")
 
 
 def section(title: str) -> None:
@@ -612,8 +623,7 @@ def test_timeout_budget() -> None:
     section("7. 硬超时预算（启用测速后必须变大）")
     prod = ProxyCheckEngine(CheckConfig(timeout=12, detect_timeout=8, check_rounds=2))
     # 基线已测得的稳定态（「基线尚未测得」要多预留一次基线开销，见第 15 节）。
-    prod._uplink_baseline_measured = True
-    prod._uplink_baseline = 3400
+    proxy_check.set_uplink_baseline(3400)
     zai_on = prod._single_proxy_timeout(2, ZAI)
     check("zai 启用测速（基线已测得）→ 98 + 40 = 138", zai_on == 138, zai_on)
     check("硬超时上限为 240", prod._single_proxy_timeout(10, ZAI) == 240,
@@ -636,8 +646,7 @@ def test_timeout_budget() -> None:
 
     custom_budget = ProxyCheckEngine(CheckConfig(timeout=12, detect_timeout=8, check_rounds=2,
                                                  uplink_budget=25))
-    custom_budget._uplink_baseline_measured = True
-    custom_budget._uplink_baseline = 3400
+    proxy_check.set_uplink_baseline(3400)
     check("uplink_budget 可配置（98 + 25 = 123）",
           custom_budget._single_proxy_timeout(2, ZAI) == 123,
           custom_budget._single_proxy_timeout(2, ZAI))
@@ -1093,11 +1102,12 @@ def test_baseline_saturation() -> None:
         proxy_check.UPLINK_BASELINE_STABILITY = 40
 
         # 11.1 自动基线 = 3 次直连读数的中位；超基线被截断
+        proxy_check.reset_uplink_baseline_state()
         engine = make_engine()
         calls = _install_fake_transfer(engine, line_kbps=7142, baseline_kbps=[3400, 3430, 3460])
         hot = _probe_once(engine, "http://10.11.0.1:8080")
         check("自动基线 = 3 次直连读数的中位 3430（基线自身不被截断）",
-              engine._uplink_baseline == 3430, engine._uplink_baseline)
+              proxy_check.get_uplink_baseline() == 3430, proxy_check.get_uplink_baseline())
         check("基线只测一轮、共 3 次直连", calls["direct"] == 3, calls["direct"])
         check("7142KB/s 的假高值被截断到基线 3430", hot.up_kbps == 3430, hot.up_kbps)
         detail = hot.checks_detail.get("uplink", {})
@@ -1119,11 +1129,12 @@ def test_baseline_saturation() -> None:
               low.checks_detail.get("uplink"))
 
         # 11.3 基线不稳定（3 次里 1100 偏离中位 67%） =>  不截断
+        proxy_check.reset_uplink_baseline_state()
         engine_unstable = make_engine()
         _install_fake_transfer(engine_unstable, line_kbps=7142, baseline_kbps=[3400, 1100, 3400])
         unstable = _probe_once(engine_unstable, "http://10.11.0.3:8080")
-        check("基线不稳定  =>  弃用（_uplink_baseline=None）", engine_unstable._uplink_baseline is None,
-              engine_unstable._uplink_baseline)
+        check("基线不稳定  =>  弃用（进程级基线为 None）", proxy_check.get_uplink_baseline() is None,
+              proxy_check.get_uplink_baseline())
         check("不稳定  =>  不截断，保留原始 7142（宁可留假高值也不错截）",
               unstable.up_kbps == 7142, unstable.up_kbps)
         check("不稳定  =>  detail 标 baseline_unavailable",
@@ -1131,11 +1142,13 @@ def test_baseline_saturation() -> None:
               unstable.checks_detail.get("uplink"))
 
         # 11.4 基线测不出来  =>  不截断 + unavailable
+        proxy_check.reset_uplink_baseline_state()
         engine_fail = make_engine()
         _install_fake_transfer(engine_fail, line_kbps=7142, baseline_kbps=[])
         failed = _probe_once(engine_fail, "http://10.11.0.4:8080")
-        check("基线测不出来  =>  不截断", failed.up_kbps == 7142 and engine_fail._uplink_baseline is None,
-              (failed.up_kbps, engine_fail._uplink_baseline))
+        check("基线测不出来  =>  不截断",
+              failed.up_kbps == 7142 and proxy_check.get_uplink_baseline() is None,
+              (failed.up_kbps, proxy_check.get_uplink_baseline()))
         check("基线不可用  =>  detail 标 baseline_unavailable",
               failed.checks_detail["uplink"].get("baseline_unavailable") is True,
               failed.checks_detail.get("uplink"))
@@ -1170,6 +1183,7 @@ def test_baseline_saturation() -> None:
 
         # 11.8 同步路径同语义
         proxy_check.UPLINK_BASELINE_KBPS = 0
+        proxy_check.reset_uplink_baseline_state()
         engine_sync = make_engine()
         calls_sync = _install_fake_transfer(engine_sync, line_kbps=7142,
                                             baseline_kbps=[3400, 3430, 3460], sync=True)
@@ -1384,6 +1398,7 @@ def test_baseline_before_batch() -> None:
         proxy_check.UPLINK_BASELINE_STABILITY = 40
 
         # 14.1 check_many_async：基线直连测量发生在第一条线路被检测之前
+        proxy_check.reset_uplink_baseline_state()
         engine = make_engine()
         order: List[str] = []
         calls = _install_fake_transfer(engine, line_kbps=2000, baseline_kbps=[3400, 3430, 3460])
@@ -1404,6 +1419,7 @@ def test_baseline_before_batch() -> None:
         check("check_many_async：两条线路都跑到了", len(order) == 2, order)
 
         # 14.2 check_proxy_full_async 入口同样先测基线
+        proxy_check.reset_uplink_baseline_state()
         engine2 = make_engine()
         order2: List[str] = []
         calls2 = _install_fake_transfer(engine2, line_kbps=2000, baseline_kbps=[3400, 3430, 3460])
@@ -1429,6 +1445,7 @@ def test_baseline_before_batch() -> None:
         check("基线已缓存时不重复测", calls2["direct"] == 3, calls2["direct"])
 
         # 14.4 同步入口同样先测基线
+        proxy_check.reset_uplink_baseline_state()
         engine3 = make_engine()
         calls3 = _install_fake_transfer(engine3, line_kbps=2000, baseline_kbps=[3400, 3430, 3460],
                                         sync=True)
@@ -1449,16 +1466,17 @@ def test_baseline_before_batch() -> None:
 # ── 15. 硬超时给「基线尚未测得」留双保险（v6.7.3 P1）──────────────────────
 def test_timeout_includes_baseline() -> None:
     section("15. 硬超时双保险：基线尚未测得时额外加一次基线开销")
+    proxy_check.reset_uplink_baseline_state()
     engine = make_engine(timeout=12, detect_timeout=8, check_rounds=2)
     fresh = engine._single_proxy_timeout(2, ZAI)
-    baseline_cost = (proxy_check.UPLINK_BASELINE_RUNS * engine._baseline_transfer_budget()
-                     + int(engine._baseline_wait_seconds()))
+    baseline_cost = engine._baseline_cost_estimate()
     check("基线未测得 → 硬超时 ≥ 138 + 基线开销", fresh >= 138 + baseline_cost,
           {"budget": fresh, "baseline_cost": baseline_cost})
     check("基线未测得 → 硬超时 ≤ 240 上限", fresh <= 240, fresh)
+    check("基线开销被总 deadline 封顶",
+          baseline_cost <= 10 + int(engine._baseline_wait_seconds()), baseline_cost)
 
-    engine._uplink_baseline_measured = True
-    engine._uplink_baseline = 3400
+    proxy_check.set_uplink_baseline(3400)
     check("基线已测得 → 回到 138", engine._single_proxy_timeout(2, ZAI) == 138,
           engine._single_proxy_timeout(2, ZAI))
     check("claude（无测速）不受影响", engine._single_proxy_timeout(2, TARGET_PROFILES["claude"]) == 50,
@@ -1515,6 +1533,158 @@ def test_process_level_quota() -> None:
         (proxy_check.UPLINK_PROBE_CONCURRENCY, proxy_check.UPLINK_PROBE_WAIT_SECONDS) = original
 
 
+# ── 17. 基线与配额提到进程级 + 基线整体硬超时（v6.7.4）────────────────────
+def test_process_wide_state() -> None:
+    section("17. 基线与配额是进程级的（重建引擎不再多一份）")
+    original = (proxy_check.UPLINK_PROBE_CONCURRENCY, proxy_check.UPLINK_PROBE_WAIT_SECONDS,
+                proxy_check.UPLINK_BASELINE_KBPS, proxy_check.UPLINK_BASELINE_RUNS,
+                proxy_check.UPLINK_BASELINE_STABILITY, proxy_check.UPLINK_BASELINE_TOTAL_SECONDS)
+    try:
+        proxy_check.UPLINK_PROBE_CONCURRENCY = 2
+        proxy_check.UPLINK_PROBE_WAIT_SECONDS = 3
+        proxy_check.UPLINK_BASELINE_KBPS = 0
+        proxy_check.UPLINK_BASELINE_RUNS = 3
+        proxy_check.UPLINK_BASELINE_STABILITY = 40
+        proxy_check.UPLINK_BASELINE_TOTAL_SECONDS = 10
+
+        # 17.1 两个引擎实例共用同一把配额闸
+        engine_a, engine_b = make_engine(), make_engine()
+        gate_a = engine_a._uplink_gate_for_thread()
+        gate_b = engine_b._uplink_gate_for_thread()
+        check("两个引擎实例拿到同一把配额闸（重建引擎不再多一份）",
+              gate_a is not None and gate_a is gate_b, (id(gate_a), id(gate_b)))
+        check("模块级只读入口与实例入口是同一把闸",
+              proxy_check.uplink_gate() is gate_a, id(proxy_check.uplink_gate()))
+
+        # 17.2 两个实例（两个线程/两个事件循环）合计在飞 ≤ 上限
+        proxy_check.set_uplink_baseline(3400)      # 基线已就绪 ⇒ 直接测线路
+        tracker = {"now": 0, "max": 0}
+        tracker_lock = threading.Lock()
+
+        def run_engine(engine, tag):
+            def go():
+                async def one():
+                    sessions = [FakeSession(per_chunk_delay=0.02, tracker=tracker,
+                                            tracker_lock=tracker_lock) for _ in range(2)]
+                    results = [RoundResult(service_reachable=True) for _ in range(2)]
+                    await asyncio.gather(*[
+                        engine._probe_uplink_async(sessions[i], results[i], ZAI,
+                                                   {"https": "http://10.40.%d.%d:8080" % (tag, i)})
+                        for i in range(2)
+                    ])
+                asyncio.run(one())
+            return go
+
+        threads = [threading.Thread(target=run_engine(engine_a, 1)),
+                   threading.Thread(target=run_engine(engine_b, 2))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        check("两个引擎实例合计在飞 ≤ 上限 2（旧实现挂实例上会到 4）",
+              tracker["max"] <= 2, tracker["max"])
+
+        # 17.3 两个实例共享基线状态：A 测过之后 B 一次直连都不再发
+        proxy_check.reset_uplink_baseline_state()
+        engine_c, engine_d = make_engine(), make_engine()
+        _install_fake_transfer(engine_c, line_kbps=2000, baseline_kbps=[3400, 3430, 3460])
+        calls_d = _install_fake_transfer(engine_d, line_kbps=2000, baseline_kbps=[3400, 3430, 3460])
+        _probe_once(engine_c, "http://10.41.0.1:8080")
+        result_d = _probe_once(engine_d, "http://10.41.0.2:8080")
+        check("实例 A 把基线写进进程级状态（3430）",
+              proxy_check.get_uplink_baseline() == 3430, proxy_check.get_uplink_baseline())
+        check("实例 B 0 次直连测量（重建引擎不再重测基线）",
+              calls_d["direct"] == 0, calls_d["direct"])
+        check("实例 B 用的是同一份基线",
+              result_d.checks_detail["uplink"].get("baseline_kbps") == 3430,
+              result_d.checks_detail.get("uplink"))
+
+        # 17.4 失败后不重试（每进程最多尝试一次）
+        proxy_check.reset_uplink_baseline_state()
+        engine_e = make_engine()
+        calls_e = _install_fake_transfer(engine_e, line_kbps=2000, baseline_kbps=[])
+        _probe_once(engine_e, "http://10.42.0.1:8080")
+        check("基线失败也置 attempted", proxy_check.uplink_baseline_attempted() is True)
+        second_e = _probe_once(engine_e, "http://10.42.0.2:8080")
+        check("基线失败后不再重试（仍只 3 次直连）", calls_e["direct"] == 3, calls_e["direct"])
+        check("基线不可用时照常测线路（不截断）", second_e.up_kbps == 2000, second_e.up_kbps)
+
+        # 17.5 基线整体硬超时：卡住的直连不许拖过 UPLINK_BASELINE_TOTAL_SECONDS
+        proxy_check.reset_uplink_baseline_state()
+        proxy_check.UPLINK_BASELINE_TOTAL_SECONDS = 1
+        engine_f = make_engine()
+
+        async def hanging_transfer(session, proxy, stop_event=None, budget=None):
+            if proxy:
+                return _marks_at(2000), 200, None, 100.0
+            await asyncio.sleep(5.0)       # 卡住，远超总 deadline
+            return _marks_at(3400), 200, None, 5000.0
+
+        engine_f._transfer_uplink_async = hanging_transfer  # type: ignore[method-assign]
+        started = time.time()
+        value = asyncio.run(engine_f.warm_uplink_baseline_async())
+        elapsed = time.time() - started
+        check("基线总超时：在 TOTAL+缓冲 内返回", elapsed <= 1 + 2.5, round(elapsed, 1))
+        check("总超时后放弃截断（基线为 None）", value is None and proxy_check.get_uplink_baseline() is None,
+              value)
+        check("总超时也算已尝试（不重试）", proxy_check.uplink_baseline_attempted() is True)
+
+        # 17.6 测量期间收到停止信号：轮次之间立即收尾，不继续下一轮
+        proxy_check.reset_uplink_baseline_state()
+        proxy_check.UPLINK_BASELINE_TOTAL_SECONDS = 10
+        engine_g = make_engine()
+        rounds: List[bool] = []
+        flag = {"set": False}
+
+        async def stop_aware_transfer(session, proxy, stop_event=None, budget=None):
+            rounds.append(bool(proxy))
+            if not proxy:
+                flag["set"] = True          # 第一轮测完就置停止信号
+            return (_marks_at(2000) if proxy else _marks_at(3400)), 200, None, 100.0
+
+        engine_g._transfer_uplink_async = stop_aware_transfer  # type: ignore[method-assign]
+
+        class _Flag:
+            def is_set(self) -> bool:
+                return flag["set"]
+
+        started = time.time()
+        value = asyncio.run(engine_g.warm_uplink_baseline_async(_Flag()))
+        check("停止信号在轮次之间生效：只跑 1 轮直连",
+              len([x for x in rounds if not x]) == 1, rounds)
+        check("停止后立刻返回（远小于总 deadline）", time.time() - started < 9.0,
+              round(time.time() - started, 1))
+        check("已有 1 轮读数时照常采用（不因停止而丢弃）", value == 3400, value)
+
+        # 17.7 基线拿不到配额：放弃截断、不阻塞批次
+        proxy_check.reset_uplink_baseline_state()
+        proxy_check.UPLINK_PROBE_CONCURRENCY = 2
+        proxy_check.UPLINK_PROBE_WAIT_SECONDS = 0
+        proxy_check.UPLINK_BASELINE_TOTAL_SECONDS = 10
+        engine_h = make_engine()
+        calls_h = _install_fake_transfer(engine_h, line_kbps=7142, baseline_kbps=[3400, 3430, 3460])
+        gate = proxy_check.uplink_gate()
+        assert gate is not None
+        gate.acquire()
+        gate.acquire()
+        try:
+            started = time.time()
+            value_h = asyncio.run(engine_h.warm_uplink_baseline_async())
+            elapsed_h = time.time() - started
+        finally:
+            gate.release()
+            gate.release()
+        check("配额占满 → 基线放弃（None）", value_h is None, value_h)
+        check("配额占满 → 0 次直连流量", calls_h["direct"] == 0, calls_h["direct"])
+        check("配额占满 → 不阻塞（≤ 等锁上限）", elapsed_h <= 1.0, round(elapsed_h, 1))
+        check("配额占满也算已尝试（不重试）", proxy_check.uplink_baseline_attempted() is True)
+    finally:
+        (proxy_check.UPLINK_PROBE_CONCURRENCY, proxy_check.UPLINK_PROBE_WAIT_SECONDS,
+         proxy_check.UPLINK_BASELINE_KBPS, proxy_check.UPLINK_BASELINE_RUNS,
+         proxy_check.UPLINK_BASELINE_STABILITY, proxy_check.UPLINK_BASELINE_TOTAL_SECONDS) = original
+        proxy_check.reset_uplink_baseline_state()
+
+
 def main() -> None:
     print("上行吞吐（up_kbps）自检开始")
     print(f"  UPLINK_PROBE={os.environ.get('UPLINK_PROBE')}  "
@@ -1536,6 +1706,7 @@ def main() -> None:
     test_baseline_before_batch()
     test_timeout_includes_baseline()
     test_process_level_quota()
+    test_process_wide_state()
 
     total = len(PASSED) + len(FAILED)
     print(f"\n结果: {len(PASSED)}/{total} 通过，跳过 {len(SKIPPED)} 项")

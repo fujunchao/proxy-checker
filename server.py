@@ -196,6 +196,34 @@ UPLINK_MIN_KBPS_CFG = get_config_int("uplink_min_kbps", "UPLINK_MIN_KBPS", UPLIN
 UPLINK_BUDGET_CFG = get_config_int("uplink_budget", "UPLINK_BUDGET", UPLINK_BUDGET)
 UPLINK_MIN_BYTES_CFG = get_config_int("uplink_min_bytes", "UPLINK_MIN_BYTES", UPLINK_MIN_BYTES)
 
+
+def start_uplink_baseline_warmup(reason="startup"):
+    """后台预热宿主机上行基线；失败只记日志，绝不阻塞启动、不影响检测。
+
+    为什么必须放在批次之外：基线探测要直连传好几 MB（还要取中位数），塞进维护批次里
+    会把首批预算（120s）吃掉一大块，外部看到的就是「维护批次没进展」。
+    引擎侧对「进程级只尝试一次」有闸门：重建引擎后再调几乎零成本，不会重复烧流量。
+    """
+    if not UPLINK_PROBE_CFG:
+        # 上行测速总开关关掉了，基线没有消费者，不必为此烧直连流量。
+        return None
+    engine = check_engine
+    warm = getattr(engine, "warm_uplink_baseline_async", None)
+    if not callable(warm):
+        # 引擎还没提供入口时静默跳过：预热是优化项，不是功能依赖。
+        return None
+
+    def run():
+        try:
+            asyncio.run(warm())
+        except Exception as exc:  # 任何异常都只能留在日志里，绝不能冒泡到启动流程
+            log.warning("uplink baseline warmup failed (%s): %s", reason, exc)
+
+    thread = threading.Thread(target=run, name="uplink-baseline-warmup", daemon=True)
+    thread.start()
+    return thread
+
+
 TARGET_CHAT = DEFAULT_TARGET_CHAT
 check_engine = ProxyCheckEngine(
     CheckConfig(
@@ -208,6 +236,8 @@ check_engine = ProxyCheckEngine(
         uplink_min_bytes=UPLINK_MIN_BYTES_CFG,
     )
 )
+# 基线预热放到批次之外：它最多要传几 MB，塞进维护批次会吃掉首批预算（P1）。
+start_uplink_baseline_warmup("进程启动")
 
 sessions = {}
 sessions_lock = threading.Lock()
@@ -992,6 +1022,9 @@ def apply_runtime_settings(settings):
             uplink_min_bytes=UPLINK_MIN_BYTES_CFG,
         )
     )
+    # 重建引擎后也预热一次：进程内已尝试过时引擎会立即返回（成本为零），
+    # 否则新引擎能在批次之外先把基线测好，维护批次不必再等它。
+    start_uplink_baseline_warmup("引擎重建")
     return password_changed
 
 

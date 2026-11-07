@@ -146,5 +146,106 @@ b.reply(pending, {config: {enabled: false}, state: {}, new: []});
 assert.equal(w.autoStatusCache, oldState, '登出后的旧请求不能更改状态');
 assert.equal(w.autoSessionId, '');
 assert.equal(w.autoPageRequest, null);
+// 保存成功后要回读云端：服务端会保护 up_kbps/up_error 等只读测量字段，
+// 只拿提交的那份回写本地，读数就永远回不到浏览器（P2）。
+// 包一层 loadRepoFromServer 来数「回读是否走既有的加载函数」，应用内按全局名调用，包得住。
+function spyRepoLoads(ctx) {
+  const state = {count: 0};
+  const original = ctx.loadRepoFromServer;
+  ctx.loadRepoFromServer = function (cb, opt) { state.count++; return original(cb, opt); };
+  return state;
+}
+function newReadsSince(bucket, index, suffix) {
+  return bucket.requests.slice(index).filter(r => r.url.endsWith(suffix));
+}
+
+const refresh = browser();
+bind(refresh, 'save_refresh');
+const rw = refresh.context;
+const refreshLoads = spyRepoLoads(rw);
+const firstLoad = refresh.requests.find(r => r.url.endsWith('/api/repo/save_refresh.json'));
+firstLoad.getResponseHeader = name => name === 'X-Repo-Revision' ? '7' : null;
+refresh.reply(firstLoad, [{proxy: 'http://192.0.2.20:80', grade: 'A'}]);
+assert.equal(rw.loadRepo()[0].up_kbps, undefined, '客户端手里这份本来就没有读数');
+rw.syncRepoToServer();
+const saveReq = refresh.requests.filter(r => r.url.endsWith('/api/repo/save')).at(-1);
+const beforeSaveReply = refresh.requests.length;
+refresh.reply(saveReq, {ok: true, count: 1, current_count: 1, repo_revision: 8});
+const reRead = newReadsSince(refresh, beforeSaveReply, '/api/repo/save_refresh.json')[0];
+assert.ok(reRead, '保存成功后必须回读云端仓库');
+assert.equal(refreshLoads.count, 1, '回读复用既有的云端加载函数，没有另起一套请求栈');
+reRead.getResponseHeader = () => '8';
+refresh.reply(reRead, [{proxy: 'http://192.0.2.20:80', grade: 'A', up_kbps: 320, up_error: 'timeout'}]);
+assert.equal(rw.loadRepo()[0].up_kbps, 320, '服务端保护下来的读数要回到浏览器');
+assert.equal(rw.loadRepo()[0].up_error, 'timeout', '测速失败原因同样要回读回来');
+assert.equal(rw.readRepoSyncMeta().revision, 8, '回写要带上服务端版本号');
+assert.equal(refresh.requests.filter(r => r.url.endsWith('/api/repo/save')).length, 1,
+  '回读不得再触发一次保存（否则会打成循环）');
+
+// 保存期间用户又改了仓库（代次变化）→ 本地不回写，也不再发起回读。
+const edited = browser();
+bind(edited, 'save_edited');
+const editedW = edited.context;
+const editedLoads = spyRepoLoads(editedW);
+const editedLoad = edited.requests.find(r => r.url.endsWith('/api/repo/save_edited.json'));
+editedLoad.getResponseHeader = () => '1';
+edited.reply(editedLoad, [{proxy: 'http://192.0.2.50:80', grade: 'A'}]);
+editedW.syncRepoToServer();
+const editedSave = edited.requests.filter(r => r.url.endsWith('/api/repo/save')).at(-1);
+editedW.addRepoItems([{proxy: 'http://192.0.2.51:80', grade: 'B'}]);
+edited.reply(editedSave, {ok: true, count: 1, current_count: 1, repo_revision: 2});
+assert.equal(editedLoads.count, 0, '保存期间用户改了仓库就不要再回读');
+assert.equal(editedW.loadRepo().length, 2, '保存响应不能覆盖用户在等待期间的新编辑');
+
+// 回读在途时用户又改了仓库 → 放弃这次回写（用过期快照盖新编辑是最坏的情况）。
+const race = browser();
+bind(race, 'save_race');
+const raceW = race.context;
+const raceLoads = spyRepoLoads(raceW);
+const raceLoad = race.requests.find(r => r.url.endsWith('/api/repo/save_race.json'));
+raceLoad.getResponseHeader = () => '1';
+race.reply(raceLoad, [{proxy: 'http://192.0.2.40:80', grade: 'A'}]);
+raceW.syncRepoToServer();
+const raceSave = race.requests.filter(r => r.url.endsWith('/api/repo/save')).at(-1);
+const beforeRaceReply = race.requests.length;
+race.reply(raceSave, {ok: true, count: 1, current_count: 1, repo_revision: 2});
+const raceRead = newReadsSince(race, beforeRaceReply, '/api/repo/save_race.json')[0];
+assert.ok(raceRead, '保存成功后应当发起回读');
+assert.equal(raceLoads.count, 1, '回读只发起一次');
+raceW.addRepoItems([{proxy: 'http://192.0.2.41:80', grade: 'B'}]);
+race.reply(raceRead, [{proxy: 'http://192.0.2.40:80', grade: 'A', up_kbps: 999}]);
+assert.equal(raceW.loadRepo().length, 2, '回读不能覆盖用户在等待期间的新编辑');
+assert.equal(raceW.loadRepo().filter(item => item.up_kbps === 999).length, 0,
+  '代次已变时这次回读必须被放弃');
+
+// 回读只认 JSON：.json 失败退到 .txt 时，占位条目（grade='?'、无读数）不能覆盖本地缓存，
+// 否则保存一次就把 grade/latency/up_kbps 一起抹成占位值，且用户毫无提示。
+const jsonless = browser();
+bind(jsonless, 'save_jsonless');
+const jw = jsonless.context;
+const jsonlessLoads = spyRepoLoads(jw);
+const jsonlessLoad = jsonless.requests.find(r => r.url.endsWith('/api/repo/save_jsonless.json'));
+jsonlessLoad.getResponseHeader = () => '5';
+jsonless.reply(jsonlessLoad, [{proxy: 'http://192.0.2.60:80', grade: 'A', latency: 100, up_kbps: 320}]);
+assert.equal(jw.loadRepo()[0].up_kbps, 320);
+let toasts = 0;
+const originalToast = jw.toast;
+jw.toast = function (message) { toasts++; return originalToast(message); };
+jw.syncRepoToServer();
+const jsonlessSave = jsonless.requests.filter(r => r.url.endsWith('/api/repo/save')).at(-1);
+const beforeJsonlessReply = jsonless.requests.length;
+jsonless.reply(jsonlessSave, {ok: true, count: 1, current_count: 1, repo_revision: 6});
+const jsonRead = newReadsSince(jsonless, beforeJsonlessReply, '/api/repo/save_jsonless.json')[0];
+assert.ok(jsonRead, '保存成功后要回读');
+assert.equal(jsonlessLoads.count, 1, '回读走既有加载函数');
+jsonless.reply(jsonRead, 'server error', 500);
+const txtRead = jsonless.requests.filter(r => r.url.endsWith('/api/repo/save_jsonless.txt')).at(-1);
+assert.ok(txtRead, '.txt 兜底请求确实发出（否则这条用例测不到兜底路径）');
+jsonless.reply(txtRead, 'http://192.0.2.60:80');
+assert.equal(jw.loadRepo()[0].grade, 'A', 'txt 兜底的占位条目不能覆盖本地 grade');
+assert.equal(jw.loadRepo()[0].latency, 100, 'latency 同样不能被占位值抹掉');
+assert.equal(jw.loadRepo()[0].up_kbps, 320, '上行读数更不能被抹掉');
+assert.equal(toasts, 0, '回读失败必须是静默的，不打扰用户');
+
 dom.window.close();
 console.log('maintenance frontend ok');
