@@ -33,3 +33,16 @@ API 首次检测可能自己执行基线测量。静默连接没有上传块或�
 - 版本为 `v6.7.5`；发布工作流生成 `linux/amd64` 与 `linux/arm64` 镜像并更新 `latest`。
 - 无需迁移仓库数据。现有测速门槛、订阅过滤及服务端测量字段保护规则保持不变。
 - 发布不自动部署，不重启现有服务。
+
+## 发布验证记录
+
+- 修复提交：`2713cdde6fdd9e4182025311969b48a56f91dbaf`；发布源码及标签提交：`8043dc44631721bf51ab2e54bd1eb5b55397a71b`。
+- [修复分支完整 CI](https://github.com/fujunchao/proxy-checker/actions/runs/42367683252)：通过。
+- [main 完整 CI](https://github.com/fujunchao/proxy-checker/actions/runs/42367840736)：通过。
+- [标签完整测试与双架构构建](https://github.com/fujunchao/proxy-checker/actions/runs/42368018741)：通过。
+- 三处 CI 均包含固定身份、浏览器隔离两种 Docker 冒烟，以及 Compose 的 `0` / `7` 配置解析验证。
+- 本地 17 个前后端测试脚本通过；上行测速 182/182、仓库策略 130/130、Z.AI 91/91。两项外网测速本地跳过；完整标签工作流按原配置执行。
+- 镜像 `v6.7.5` 与 `latest` 清单摘要一致：`sha256:c9d46d3cdf57df9a35849e014c2d1a3b4c5f1f1dcac747dd3fda6f7e1b9bba04`。
+- `linux/amd64`：`sha256:96ca5f6d93e2f181ce7cde52d3d72e47dc10cc15572f944870c718958c868bdb`。
+- `linux/arm64`：`sha256:5a83a3ed1f4766c5d62da22ada5ca8ec14a880af99d997915215c13b875ad25f`。
+- 两个架构的镜像源码标签均为 `8043dc44631721bf51ab2e54bd1eb5b55397a71b`；未部署或重启线上服务。
