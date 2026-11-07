@@ -39,6 +39,7 @@ var autoStopRequestedSession='';
 var autoStopRepoPromptSession='';
 var autoRepoRefreshSession='';
 var autoLastRunning=false;
+var autoProgressExpanded=false,autoProgressData=null;
 var RESULT_RENDER_BATCH=400;
 var resultRenderLimits={valid:RESULT_RENDER_BATCH,invalid:RESULT_RENDER_BATCH,repo:RESULT_RENDER_BATCH};
 var resultsSaveTimer=null;
@@ -1571,9 +1572,19 @@ function timezoneOptions(selected){
   }).join('');
 }
 
+function toggleAutoProgressDetail(){
+  autoProgressExpanded=!autoProgressExpanded;
+  if(autoProgressData)renderAutoProgress(autoProgressData);
+  else{
+    var box=document.getElementById('autoProgress');
+    if(box)box.classList.toggle('expanded',autoProgressExpanded);
+  }
+}
+
 function renderAutoProgress(data){
   var box=document.getElementById('autoProgress');
   if(!box||!data)return;
+  autoProgressData=data;
   var state=data.state||{};
   var config=data.config||{};
   var tz=getAutoTimezone(data);
@@ -1591,55 +1602,64 @@ function renderAutoProgress(data){
     idle:'等待中',
     disabled:'未开启'
   };
-  var html='';
-  html+='<div>状态: '+esc(autoStatusText(data))+'</div>';
-  html+='<div>阶段: '+esc(stageMap[state.stage]||state.stage||'-')+'</div>';
-  html+='<div>自动任务档位: '+esc(config.target_profile||'未知')+' · 发现策略: '+esc(config.detect_mode||'未知')+'（与手动按钮独立）</div>';
+  // 摘要行常显，明细行折叠；折叠状态由 autoProgressExpanded 控制，轮询重绘不会把它弹回去。
+  var lines=[];
+  var detailCount=0;
+  function add(text,detail){
+    if(detail)detailCount++;
+    lines.push('<div'+(detail?' class="auto-detail"':'')+'>'+text+'</div>');
+  }
+  function value(v){return v===undefined||v===null?'未知':esc(v)}
+  add('状态: '+esc(autoStatusText(data)));
+  add('阶段: '+esc(stageMap[state.stage]||state.stage||'-'));
+  add('自动任务档位: '+esc(config.target_profile||'未知')+' · 发现策略: '+esc(config.detect_mode||'未知')+'（与手动按钮独立）');
   if(config.maintenance_mode==='continuous'){
-    function value(v){return v===undefined||v===null?'未知':esc(v)}
-    html+='<div>存量到期 '+value(state.due_count)+' · 最老已知复测年龄 '+value(state.oldest_refresh_age_seconds)+' 秒 · 时间未知 '+value(state.unknown_age_count)+'</div>';
-    html+='<div>发现队列 '+value(state.discovery_pending)+' · 待发布 '+value(state.pending_count)+' · 任务级未完成 '+value(state.incomplete_count)+'</div>';
-    html+='<div>已发布仓库 '+value(state.repo_count)+' · 版本 '+value(state.repo_revision)+' · 最近发布 '+(state.last_published_at?esc(formatAutoTime(state.last_published_at/1000,tz)):'尚无发布')+'</div>';
-    html+='<div>本批提交: 新增 '+value(state.repo_added)+' / 更新 '+value(state.repo_updated)+' / 移除 '+value(state.repo_removed)+' / 冲突跳过 '+value(state.conflict_skipped)+'</div>';
+    add('存量到期 '+value(state.due_count)+' · 最老已知复测年龄 '+value(state.oldest_refresh_age_seconds)+' 秒 · 时间未知 '+value(state.unknown_age_count),true);
+    add('发现队列 '+value(state.discovery_pending)+' · 待发布 '+value(state.pending_count)+' · 任务级未完成 '+value(state.incomplete_count),true);
+    add('已发布仓库 '+value(state.repo_count)+' · 版本 '+value(state.repo_revision)+' · 最近发布 '+(state.last_published_at?esc(formatAutoTime(state.last_published_at/1000,tz)):'尚无发布'),true);
+    add('本批提交: 新增 '+value(state.repo_added)+' / 更新 '+value(state.repo_updated)+' / 移除 '+value(state.repo_removed)+' / 冲突跳过 '+value(state.conflict_skipped),true);
     var batchSources=Array.isArray(state.source_current_ids)&&state.source_current_ids.length?state.source_current_ids.join('、'):state.source_current_id;
-    html+='<div>来源覆盖 '+value(state.source_supported_count)+'/'+value(state.source_total_count)+'（持续维护仅纯文本源） · 本批来源 '+esc(batchSources||'存量／等待中')+'</div>';
+    add('来源覆盖 '+value(state.source_supported_count)+'/'+value(state.source_total_count)+'（持续维护仅纯文本源） · 本批来源 '+esc(batchSources||'存量／等待中'),true);
     if(state.candidate_deduplicated!==undefined||state.candidate_filtered!==undefined||state.selection_seconds!==undefined){
-      html+='<div>本批选批: 有效输入 '+value(state.total)+' · 过滤库存／历史 '+value(state.candidate_filtered)+' · 合并重复候选 '+value(state.candidate_deduplicated)+' · 选批（含抓取） '+value(state.selection_seconds)+' 秒</div>';
+      add('本批选批: 有效输入 '+value(state.total)+' · 过滤库存／历史 '+value(state.candidate_filtered)+' · 合并重复候选 '+value(state.candidate_deduplicated)+' · 选批（含抓取） '+value(state.selection_seconds)+' 秒',true);
     }
-    html+='<div>最近抓取: '+(state.source_last_fetched_at?esc(formatAutoTime(state.source_last_fetched_at/1000,tz))+' · '+esc(state.source_last_id||'-'):'尚无升级后记录')+'</div>';
+    add('最近抓取: '+(state.source_last_fetched_at?esc(formatAutoTime(state.source_last_fetched_at/1000,tz))+' · '+esc(state.source_last_id||'-'):'尚无升级后记录'),true);
     var totals=state.maintenance_totals||{};
     if(totals.since){
-      html+='<div>本工作区升级后累计（自 '+esc(formatAutoTime(totals.since/1000,tz))+'，跨档位，重入库重复计次）</div>';
-      html+='<div>成功抓取 '+value(totals.source_fetches||0)+' 次 · 读取候选 '+value(totals.source_candidates||0)+' 条次 · 来源错误 '+value(totals.source_errors||0)+' 次</div>';
-      html+='<div>已提交检测: 发现 '+value(totals.discover_checked||0)+' / 复测 '+value(totals.refresh_checked||0)+' · 累计新增 '+value(totals.repo_added||0)+' / 累计更新 '+value(totals.repo_updated||0)+' / 累计移除 '+value(totals.repo_removed||0)+'</div>';
+      add('本工作区升级后累计（自 '+esc(formatAutoTime(totals.since/1000,tz))+'，跨档位，重入库重复计次）',true);
+      add('成功抓取 '+value(totals.source_fetches||0)+' 次 · 读取候选 '+value(totals.source_candidates||0)+' 条次 · 来源错误 '+value(totals.source_errors||0)+' 次',true);
+      add('已提交检测: 发现 '+value(totals.discover_checked||0)+' / 复测 '+value(totals.refresh_checked||0)+' · 累计新增 '+value(totals.repo_added||0)+' / 累计更新 '+value(totals.repo_updated||0)+' / 累计移除 '+value(totals.repo_removed||0),true);
     }else{
-      html+='<div>升级后累计: 尚无记录，不从当前批次推算历史总量。</div>';
+      add('升级后累计: 尚无记录，不从当前批次推算历史总量。',true);
     }
-    html+='<div>缺少档位待人工确认 '+value(state.migration_required)+' · 其他档位保留 '+value(state.other_profile_count)+'</div>';
-    html+='<div>目标间隔不是时限保证；页面仅保留各分类最近 1000 条诊断，检测通过不等于已提交。</div>';
-    if(state.source_error)html+='<div>'+esc(state.source_error)+'；下批仍优先检查存量。</div>';
+    add('缺少档位待人工确认 '+value(state.migration_required)+' · 其他档位保留 '+value(state.other_profile_count),true);
+    add('目标间隔不是时限保证；页面仅保留各分类最近 1000 条诊断，检测通过不等于已提交。',true);
+    if(state.source_error)add(esc(state.source_error)+'；下批仍优先检查存量。');
   }
-  html+='<div>计划时区: '+esc(tz)+'</div>';
-  html+='<div>当前时间: '+esc((data.server_time&&data.server_time.text)||formatAutoTime((data.server_time&&data.server_time.timestamp),tz))+'</div>';
-  if(data.server_time&&data.server_time.server_text&&data.server_time.server_text!==data.server_time.text)html+='<div>服务器本地: '+esc(data.server_time.server_text)+' '+esc(data.server_time.server_timezone||'')+'</div>';
-  if(config.enabled)html+='<div>下次执行: '+esc(state.next_run_text||formatAutoTime(state.next_run_at,tz))+'</div>';
+  add('计划时区: '+esc(tz),true);
+  add('当前时间: '+esc((data.server_time&&data.server_time.text)||formatAutoTime((data.server_time&&data.server_time.timestamp),tz)),true);
+  if(data.server_time&&data.server_time.server_text&&data.server_time.server_text!==data.server_time.text)add('服务器本地: '+esc(data.server_time.server_text)+' '+esc(data.server_time.server_timezone||''),true);
+  if(config.enabled)add('下次执行: '+esc(state.next_run_text||formatAutoTime(state.next_run_at,tz)));
   if(state.running){
-    html+='<div>进度: '+(state.done||0)+'/'+(state.total||0)+'，有效 '+(state.valid_count||0)+'，不稳定 '+(state.unstable_count||0)+'，失效 '+(state.invalid_count||0)+'</div>';
-    html+='<div>本批新拉取 '+(state.source_count||0)+'，仓库 '+(state.repo_count||0)+'，本批待检测 '+(state.input_count||0)+'，过滤跳过 '+(state.skipped||0)+'</div>';
+    add('进度: '+(state.done||0)+'/'+(state.total||0)+'，有效 '+(state.valid_count||0)+'，不稳定 '+(state.unstable_count||0)+'，失效 '+(state.invalid_count||0));
+    add('本批新拉取 '+(state.source_count||0)+'，仓库 '+(state.repo_count||0)+'，本批待检测 '+(state.input_count||0)+'，过滤跳过 '+(state.skipped||0),true);
   }
   if(state.last_summary){
     var s=state.last_summary;
-    html+='<div>上次: '+esc(s.status||'-')+'，检测 '+(s.done||0)+'/'+(s.total||0)+'，入库 +'+(s.repo_added||0)+'，更新 '+(s.repo_updated||0)+'，删除 '+(s.repo_removed||0)+'</div>';
-    if(s.error)html+='<div style="color:#ef4444">错误: '+esc(s.error)+'</div>';
+    add('上次: '+esc(s.status||'-')+'，检测 '+(s.done||0)+'/'+(s.total||0)+'，入库 +'+(s.repo_added||0)+'，更新 '+(s.repo_updated||0)+'，删除 '+(s.repo_removed||0));
+    if(s.error)add('<span style="color:#ef4444">错误: '+esc(s.error)+'</span>');
   }
   if(Array.isArray(state.history)&&state.history.length){
-    html+='<div class="auto-history">';
+    var history='';
     state.history.slice(-5).reverse().forEach(function(item){
-      html+='<div>'+esc(formatAutoTime(item.finished_at,item.timezone||tz))+' · '+esc(item.work_type==='refresh'?'存量复测':item.work_type==='discover'?'新代理发现':item.status||'-')+' · '+(item.done||0)+'/'+(item.total||0)+' · 有效 '+(item.valid_count||0)+'</div>';
+      history+='<div>'+esc(formatAutoTime(item.finished_at,item.timezone||tz))+' · '+esc(item.work_type==='refresh'?'存量复测':item.work_type==='discover'?'新代理发现':item.status||'-')+' · '+(item.done||0)+'/'+(item.total||0)+' · 有效 '+(item.valid_count||0)+'</div>';
     });
-    html+='</div>';
+    detailCount++;
+    lines.push('<div class="auto-history auto-detail">'+history+'</div>');
   }
-  box.innerHTML=html;
+  if(detailCount)lines.push('<div class="auto-detail-toggle"><button type="button" onclick="toggleAutoProgressDetail()">'+(autoProgressExpanded?'收起明细':'展开全部明细（'+detailCount+' 项）')+'</button></div>');
+  box.innerHTML=lines.join('');
+  box.classList.toggle('expanded',!!autoProgressExpanded);
 }
 
 function openAutoSettings(){
@@ -1669,9 +1689,14 @@ function showAutoModal(data){
   overlay.className='modal-overlay show';
   overlay.dataset.modal='auto';
   overlay.onclick=function(e){if(e.target===overlay)overlay.remove()};
-  var html='<div class="modal-box" style="max-width:640px;text-align:left">';
+  // 卡片限高在视口内：头部与底部按钮常驻，只有正文滚动，避免长状态把按钮顶出屏幕。
+  autoProgressExpanded=false;
+  var html='<div class="modal-box modal-scroll" style="max-width:640px;text-align:left">';
+  html+='<div class="modal-scroll-head">';
   html+='<div class="modal-icon" style="background:linear-gradient(135deg,rgba(34,197,94,.15),rgba(34,197,94,.05));border-color:rgba(34,197,94,.22)">⏱️</div>';
   html+='<h3 style="text-align:center">自动任务</h3>';
+  html+='</div>';
+  html+='<div class="modal-scroll-body">';
   html+='<div class="auto-progress" id="autoProgress"></div>';
   html+='<div class="settings-note">启用后台自动检测：保存后服务器会按时间规则自动跑，不需要浏览器一直打开。立即运行：不等下次计划时间，马上跑一轮；是否启用定时由上面的勾选决定。</div>';
   html+='<div class="auto-form">';
@@ -1687,7 +1712,8 @@ function showAutoModal(data){
   html+='<div class="auto-field full"><label>入库策略</label><select id="autoRepoPolicy"><option value="stable_only">只入库稳定可用(A/B)，复测失败旧代理会删除</option><option value="target_only">只入库本档目标可用(usable)，最严格</option><option value="include_unstable">包含不稳定(A/B/C/D)，复测失败旧代理会删除</option><option value="archive_all">所有结果都留档，失效代理也保留</option></select></div>';
   html+='<div class="auto-field full"><div class="settings-note">本轮自动检测使用全局设置：'+esc(getRoundsValue())+' 轮，并发 '+esc(getConcurrentValue())+'。要修改请打开“设置”。</div></div>';
   html+='</div>';
-  html+='<div class="auto-action-row">';
+  html+='</div>';
+  html+='<div class="auto-action-row modal-footer">';
   html+='<button class="btn btn-primary" onclick="saveAutoSettings()">💾 保存设置</button>';
   html+='<button class="btn btn-ghost" onclick="runAutoNow()">▶️ 立即运行</button>';
   html+='<button class="btn btn-danger" id="autoStopBtn" onclick="stopAutoNow()" '+(state.running?'':'disabled')+'>⏹️ 停止任务</button>';
@@ -1797,9 +1823,12 @@ function showSettingsModal(settings){
   overlay.className='modal-overlay show';
   overlay.dataset.modal='settings';
   overlay.onclick=function(e){if(e.target===overlay)overlay.remove()};
-  var html='<div class="modal-box" style="max-width:720px;text-align:left">';
+  var html='<div class="modal-box modal-scroll" style="max-width:720px;text-align:left">';
+  html+='<div class="modal-scroll-head">';
   html+='<div class="modal-icon" style="background:linear-gradient(135deg,rgba(124,92,252,.16),rgba(124,92,252,.05));border-color:rgba(124,92,252,.22)">⚙️</div>';
   html+='<h3 style="text-align:center">设置</h3>';
+  html+='</div>';
+  html+='<div class="modal-scroll-body">';
   html+='<div class="settings-note">这里保存的是服务运行参数。轮次默认最多 3 轮，轮次越高越慢；并发越高越快，但服务器和代理源压力也越大。</div>';
   html+='<div class="settings-note" style="display:flex;align-items:center;justify-content:space-between;gap:12px"><span>Deep Check 状态</span>'+deepCheckBadgeHTML()+'</div>';
   html+='<div class="auto-form">';
@@ -1814,7 +1843,8 @@ function showSettingsModal(settings){
   html+='<div class="auto-field full"><label>新登录密码</label><input id="settingsPassword" type="password" autocomplete="new-password" placeholder="'+(settings.password_configurable?'留空表示不修改':'当前由环境变量控制，页面不能永久修改')+'" '+(settings.password_configurable?'':'disabled')+'></div>';
   html+='<div class="auto-field full"><label>确认新密码</label><input id="settingsPasswordConfirm" type="password" autocomplete="new-password" placeholder="再次输入新密码" '+(settings.password_configurable?'':'disabled')+'></div>';
   html+='</div>';
-  html+='<div class="auto-inline" style="justify-content:center;margin-top:12px">';
+  html+='</div>';
+  html+='<div class="auto-inline modal-footer" style="justify-content:center">';
   html+='<button class="btn btn-primary" onclick="saveAppSettings()">💾 保存设置</button>';
   html+='<button class="btn btn-ghost" onclick="this.closest(\'.modal-overlay\').remove()">✖️ 关闭</button>';
   html+='</div></div>';
@@ -1883,9 +1913,12 @@ function showRunLogsModal(logs){
   overlay.className='modal-overlay show';
   overlay.dataset.modal='logs';
   overlay.onclick=function(e){if(e.target===overlay)overlay.remove()};
-  var html='<div class="modal-box" style="max-width:820px;text-align:left">';
+  var html='<div class="modal-box modal-scroll" style="max-width:820px;text-align:left">';
+  html+='<div class="modal-scroll-head">';
   html+='<div class="modal-icon" style="background:linear-gradient(135deg,rgba(96,165,250,.16),rgba(96,165,250,.05));border-color:rgba(96,165,250,.22)">📋</div>';
   html+='<h3 style="text-align:center">📋 日志</h3>';
+  html+='</div>';
+  html+='<div class="modal-scroll-body">';
   html+='<div class="settings-note">记录手动检测和自动任务的开始时间、结束时间、模式、轮次、并发、数量和结果摘要。</div>';
   html+='<div class="log-list" id="runLogList">';
   if(logs===null){
@@ -1916,7 +1949,8 @@ function showRunLogsModal(logs){
     });
   }
   html+='</div>';
-  html+='<div class="auto-inline" style="justify-content:center;margin-top:12px">';
+  html+='</div>';
+  html+='<div class="auto-inline modal-footer" style="justify-content:center">';
   html+='<button class="btn btn-danger" onclick="clearRunLogs()">&#128465; 清空日志</button>';
   html+='<button class="btn btn-ghost" onclick="openRunLogs();this.closest(\'.modal-overlay\').remove()">🔄 刷新</button>';
   html+='<button class="btn btn-ghost" onclick="this.closest(\'.modal-overlay\').remove()">✖️ 关闭</button>';
