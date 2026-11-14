@@ -265,7 +265,8 @@ class MaintenancePipeline(unittest.TestCase):
 
     def test_unknown_age_is_not_a_completed_observation_at_clock_zero(self):
         self.now = 0.0
-        self.config.update(refresh_batch=1, refresh_budget_seconds=600)
+        # 预算显式给 121s：默认预算已抬到 180s，慢项推进 121s 不再触发「到点收尾」。
+        self.config.update(refresh_batch=1, refresh_budget_seconds=600, batch_seconds=121)
         self.store.save([item(1), item(2), item(3)], 'replace', 0)
         case = self
 

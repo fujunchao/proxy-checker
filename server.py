@@ -782,6 +782,19 @@ def run_logs_payload(token):
     }
 
 
+def min_batch_seconds(rounds=None):
+    """批次预算下限（秒）：必须覆盖单条线路的最坏路径，否则「到点收尾」会退化成系统性截断。
+
+    推导：单条最坏 ≈ 每轮 44s（服务探针 12s×2 次 + 探测超时 8s + 附加探针 12s）× 轮数，
+    加首轮上行测速 40s 与 10s 余量（见 proxy_check._single_proxy_timeout 的 138s 上限），
+    再留约 40s 给发布收尾（每 20 条 / 10 秒；200 条约 100s 的发布地板与检测并行）。
+    2 轮 = 180s、3 轮 = 240s。2026-11-14 生产核查：预算 120s < 单条硬超时 138s 时，
+    近 24h 有 71% 的发现批被截断（200 条平均只完成 114 条）。
+    """
+    rounds = max(1, int(rounds if rounds is not None else CHECK_ROUNDS))
+    return 120 + 60 * (rounds - 1)
+
+
 def default_auto_config():
     return {
         "enabled": False,
@@ -789,7 +802,7 @@ def default_auto_config():
         "refresh_seconds": 900,
         "refresh_batch": 100,
         "discover_batch": 200,
-        "batch_seconds": 120,
+        "batch_seconds": min_batch_seconds(),
         "publish_count": 20,
         "publish_seconds": 10,
         "refresh_share": 4,
@@ -854,7 +867,8 @@ def normalize_auto_config(config):
         "maintenance_mode": "continuous" if merged.get("maintenance_mode") == "continuous" else "legacy",
         **{k: max(lo, min(hi, get_int_from(merged, k, defaults[k]))) for k, lo, hi in (
             ("refresh_seconds", 30, 86400), ("refresh_batch", 1, 100), ("discover_batch", 1, 200),
-            ("batch_seconds", 1, 120), ("publish_count", 1, 200), ("publish_seconds", 1, 60),
+            # 下限跟着轮数走：预算低于单条硬超时，批次必然被「到点收尾」砍掉（见 min_batch_seconds）。
+            ("batch_seconds", min_batch_seconds(), 600), ("publish_count", 1, 200), ("publish_seconds", 1, 60),
             ("refresh_share", 1, 20), ("refresh_budget_seconds", 1, 600))},
         "schedule_type": schedule_type,
         "interval_hours": interval_hours,
@@ -1253,6 +1267,8 @@ def is_auto_running(token):
 
 MAINTENANCE_STATUS_FIELDS = ("work_type", "due_count", "unknown_age_count", "oldest_checked_at",
     "migration_required", "other_profile_count", "discovery_pending", "pending_count", "incomplete_count",
+    "batch_seconds", "batch_truncated", "batch_elapsed_seconds",
+    "discover_machine_seconds", "refresh_machine_seconds",
     "last_published_at", "repo_revision", "repo_added", "repo_updated", "repo_removed", "conflict_skipped",
     "last_progress_at", "source_error", "source_current_id", "source_last_id", "source_last_fetched_at",
     "source_supported_count", "source_total_count", "maintenance_totals", "source_current_ids",
@@ -1484,9 +1500,11 @@ def finalize_auto_run(token, runtime, status, error=None, repo_summary=None):
         "session_id": runtime.get("run_id"),
         "target_name": get_target_profile_name(summary.get("target_profile")),
     })
-    log.info("maintenance end workspace=%s run=%s status=%s done=%s total=%s",
+    # D：截断可观测——本批为什么收尾、还剩多少、预算多少，日志与状态都能对账。
+    log.info("maintenance end workspace=%s run=%s status=%s done=%s total=%s incomplete=%s budget_seconds=%s truncated=%s",
              hashlib.sha256(token.encode()).hexdigest()[:10], runtime.get("run_id"), status,
-             summary["done"], summary["total"])
+             summary["done"], summary["total"], summary.get("incomplete_count", 0),
+             summary.get("batch_seconds"), bool(summary.get("batch_truncated")))
 
 
 def execute_maintenance_run(token, config, runtime, *, engine=None, source=None, clock=time.time,
@@ -1523,7 +1541,8 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
                         source_last_id=state.get("source_last_id"), source_error=None,
                         source_last_fetched_at=state.get("source_last_fetched_at"), source_current_id=None,
                         source_count=0, source_current_ids=[], candidate_deduplicated=queues.duplicate_count,
-                        candidate_filtered=0, selection_seconds=0)
+                        candidate_filtered=0, selection_seconds=0,
+                        batch_seconds=config["batch_seconds"], batch_truncated=False, incomplete_count=0)
     selection_snapshot = store.snapshot()
     selection_epoch = selection_snapshot["epoch"]
     work_type, proxies, info = choose_batch(selection_snapshot, state, config, clock())
@@ -1622,10 +1641,22 @@ def execute_maintenance_run(token, config, runtime, *, engine=None, source=None,
                                      lambda **s: update_auto_runtime(token, **s), clock=timer_clock)
             batch_started = timer_clock()
             summary, completed = await batch.run(proxies)
+            elapsed = max(0.0, timer_clock() - batch_started)
+            # 机时按批次类型累计（跨重启、跨档位保留）；预算计数器仍只用于「连续复测让出发现」。
             if work_type == "refresh":
-                state["refresh_spent_seconds"] = state.get("refresh_spent_seconds", 0) + max(0, timer_clock() - batch_started)
+                state["refresh_spent_seconds"] = state.get("refresh_spent_seconds", 0) + elapsed
+                state["refresh_machine_seconds"] = state.get("refresh_machine_seconds", 0) + elapsed
+            else:
+                state["discover_machine_seconds"] = state.get("discover_machine_seconds", 0) + elapsed
             complete_keys = set(map(proxy_key, completed))
             unfinished = [p for p in proxies if proxy_key(p) not in complete_keys]
+            # D：把「预算截断」和「人工停止」分开暴露；未完成数就是本批排回重试队列的条数。
+            update_auto_runtime(token, batch_seconds=config["batch_seconds"],
+                                batch_truncated=bool(summary.get("budget_exceeded")),
+                                incomplete_count=len(unfinished),
+                                batch_elapsed_seconds=round(elapsed, 1),
+                                discover_machine_seconds=int(state.get("discover_machine_seconds", 0)),
+                                refresh_machine_seconds=int(state.get("refresh_machine_seconds", 0)))
             if work_type == "discover":
                 # 来源已前进到下一队列；慢项独立重试，不绑定任何来源的尾部。
                 queue_retry(unfinished)

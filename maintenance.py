@@ -290,11 +290,19 @@ class IncrementalBatch:
             detection = asyncio.create_task(detect(slots))
             publisher = asyncio.create_task(publish())
             started = self.clock()
+            # 「预算到点收尾」与「人工停止」必须可区分：前者只是本批收尾，未完成项由调用方放回重试队列；
+            # 后者会暂停接续。日志与状态字段（D）都要能说明是哪一种。
+            budget_exceeded = False
             try:
                 while not detection.done():
                     if publisher.done() and publisher.exception():
                         raise publisher.exception()
-                    if self.stop.is_set() or self.clock() - started >= cfg["batch_seconds"]:
+                    if self.stop.is_set():
+                        budget_stop.set()
+                        detection.cancel()
+                        break
+                    if self.clock() - started >= cfg["batch_seconds"]:
+                        budget_exceeded = True
                         budget_stop.set()
                         detection.cancel()
                         break
@@ -317,7 +325,10 @@ class IncrementalBatch:
                 publisher.cancel()
                 await asyncio.gather(detection, publisher, return_exceptions=True)
         self.on_status(pending_count=0, incomplete_count=len(proxies) - completed)
-        return {**totals, "incomplete_count": len(proxies) - completed}, accepted_inputs
+        return {**totals,
+                "incomplete_count": len(proxies) - completed,
+                "budget_exceeded": bool(budget_exceeded),
+                "elapsed_seconds": round(max(0.0, self.clock() - started), 1)}, accepted_inputs
 
 
 def choose_batch(snapshot, state, config, now):
@@ -354,7 +365,10 @@ def choose_batch(snapshot, state, config, now):
             "oldest_checked_at": min(known) if known else None,
             "migration_required": sum(1 for i in snapshot["items"] if not i.get("target_profile")),
             "other_profile_count": sum(1 for i in snapshot["items"] if i.get("target_profile") not in (None, profile)),
-            "discovery_pending": discovery_pending(state)}
+            "discovery_pending": discovery_pending(state),
+            # 机时（升级后累计）：发现/复测各占多少机器时间，用来判断批次预算与公平性。
+            "discover_machine_seconds": int(state.get("discover_machine_seconds", 0)),
+            "refresh_machine_seconds": int(state.get("refresh_machine_seconds", 0))}
     streak = state.get("refresh_streak", 0)
     sparse = len(untried) <= min(10, config["refresh_batch"] // 4)
     within_time = state.get("refresh_spent_seconds", 0) < config.get("refresh_budget_seconds", 120)

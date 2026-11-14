@@ -1350,6 +1350,15 @@ function formatAutoTime(ts,timezone){
   }
 }
 
+function formatAutoDuration(seconds){
+  var s=Math.max(0,Math.round(Number(seconds)||0));
+  if(s<60)return s+' 秒';
+  var m=Math.round(s/60);
+  if(m<60)return m+' 分';
+  var h=s/3600;
+  return (h>=10?Math.round(h):Math.round(h*10)/10)+' 小时';
+}
+
 function getAutoTimezone(data){
   return (data&&data.config&&data.config.timezone)||appSettings.timezone||'UTC';
 }
@@ -1635,7 +1644,10 @@ function renderAutoProgress(data){
   add('自动任务档位: '+esc(config.target_profile||'未知')+' · 发现策略: '+esc(config.detect_mode||'未知')+'（与手动按钮独立）');
   if(config.maintenance_mode==='continuous'){
     add('存量到期 '+value(state.due_count)+' · 最老已知复测年龄 '+value(state.oldest_refresh_age_seconds)+' 秒 · 时间未知 '+value(state.unknown_age_count),true);
-    add('发现队列 '+value(state.discovery_pending)+' · 待发布 '+value(state.pending_count)+' · 任务级未完成 '+value(state.incomplete_count),true);
+    add('发现队列 '+value(state.discovery_pending)+' · 待发布 '+value(state.pending_count)+' · 任务级未完成 '+value(state.incomplete_count)+(state.batch_truncated?'（本批预算截断）':''),true);
+    if(state.batch_truncated){
+      add('上批预算 '+value(state.batch_seconds)+' 秒用尽：完成 '+(state.done||0)+'/'+(state.total||0)+'，剩余 '+value(state.incomplete_count)+' 条未完成，已排入重试队列，下一批继续');
+    }
     add('已发布仓库 '+value(state.repo_count)+' · 版本 '+value(state.repo_revision)+' · 最近发布 '+(state.last_published_at?esc(formatAutoTime(state.last_published_at/1000,tz)):'尚无发布'),true);
     add('本批提交: 新增 '+value(state.repo_added)+' / 更新 '+value(state.repo_updated)+' / 移除 '+value(state.repo_removed)+' / 冲突跳过 '+value(state.conflict_skipped),true);
     var batchSources=Array.isArray(state.source_current_ids)&&state.source_current_ids.length?state.source_current_ids.join('、'):state.source_current_id;
@@ -1651,6 +1663,10 @@ function renderAutoProgress(data){
       add('已提交检测: 发现 '+value(totals.discover_checked||0)+' / 复测 '+value(totals.refresh_checked||0)+' · 累计新增 '+value(totals.repo_added||0)+' / 累计更新 '+value(totals.repo_updated||0)+' / 累计移除 '+value(totals.repo_removed||0),true);
     }else{
       add('升级后累计: 尚无记录，不从当前批次推算历史总量。',true);
+    }
+    if(state.discover_machine_seconds!==undefined||state.refresh_machine_seconds!==undefined){
+      var dm=Number(state.discover_machine_seconds||0), rm=Number(state.refresh_machine_seconds||0);
+      add('机时（升级后累计）: 发现 '+formatAutoDuration(dm)+' · 复测 '+formatAutoDuration(rm)+((dm+rm)>0?' · 发现占 '+Math.round(dm*100/(dm+rm))+'%':''),true);
     }
     add('缺少档位待人工确认 '+value(state.migration_required)+' · 其他档位保留 '+value(state.other_profile_count),true);
     add('目标间隔不是时限保证；页面仅保留各分类最近 1000 条诊断，检测通过不等于已提交。',true);
@@ -1672,7 +1688,7 @@ function renderAutoProgress(data){
   if(Array.isArray(state.history)&&state.history.length){
     var history='';
     state.history.slice(-5).reverse().forEach(function(item){
-      history+='<div>'+esc(formatAutoTime(item.finished_at,item.timezone||tz))+' · '+esc(item.work_type==='refresh'?'存量复测':item.work_type==='discover'?'新代理发现':item.status||'-')+' · '+(item.done||0)+'/'+(item.total||0)+' · 有效 '+(item.valid_count||0)+'</div>';
+      history+='<div>'+esc(formatAutoTime(item.finished_at,item.timezone||tz))+' · '+esc(item.work_type==='refresh'?'存量复测':item.work_type==='discover'?'新代理发现':item.status||'-')+' · '+(item.done||0)+'/'+(item.total||0)+(item.batch_truncated?'（预算截断）':'')+' · 有效 '+(item.valid_count||0)+'</div>';
     });
     detailCount++;
     lines.push('<div class="auto-history auto-detail">'+history+'</div>');
@@ -1722,7 +1738,7 @@ function showAutoModal(data){
   html+='<div class="auto-form">';
   html+='<div class="auto-field full"><label><input id="autoEnabled" type="checkbox" '+(config.enabled?'checked':'')+' style="width:auto;height:auto;margin-right:8px">启用后台自动检测</label></div>';
   html+='<div class="auto-field full"><label>运行方式</label><select id="autoMaintenanceMode"><option value="legacy">旧模式：按计划完成整轮后发布</option><option value="continuous">持续维护（推荐）：存量优先、发现分批、中途发布</option></select></div>';
-  html+='<div class="auto-field full"><div class="settings-note">持续维护：存量目标 15 分钟复测一次，不受已检测历史跳过；默认连续复测耗时达到 120 秒即让出发现机会，零散到期项不连续占批。主来源公平轮转，待检跨源去重、过滤后从其他缓存补量；每批最多新抓取一个来源，不等待凑满。每批存量最多 100 / 发现最多 200，预算 120 秒，每 20 条或 10 秒发布。旧时间规则仅旧模式生效；停止后等待再次保存或立即运行。</div></div>';
+  html+='<div class="auto-field full"><div class="settings-note">持续维护：存量目标 15 分钟复测一次，不受已检测历史跳过；默认连续复测耗时达到 120 秒即让出发现机会，零散到期项不连续占批。主来源公平轮转，待检跨源去重、过滤后从其他缓存补量；每批最多新抓取一个来源，不等待凑满。每批存量最多 100 / 发现最多 200，预算 180 秒起（不低于单条硬超时，避免批次被系统性截断；轮数越多下限越高），每 20 条或 10 秒发布。旧时间规则仅旧模式生效；停止后等待再次保存或立即运行。</div></div>';
   html+='<div class="auto-field"><label>时间规则</label><select id="autoScheduleType" onchange="updateAutoScheduleFields()"><option value="interval" '+(config.schedule_type==='interval'?'selected':'')+'>每隔 N 小时</option><option value="daily" '+(config.schedule_type==='daily'?'selected':'')+'>每天固定时间</option></select></div>';
   html+='<div class="auto-field" id="autoIntervalField"><label>间隔小时</label><input id="autoIntervalHours" type="number" min="0.01" max="720" step="0.25" value="'+esc(config.interval_hours||6)+'"></div>';
   html+='<div class="auto-field" id="autoDailyField"><label>固定时间（计划时区）</label><input id="autoDailyTime" type="time" value="'+esc(config.daily_time||'03:00')+'"></div>';

@@ -118,6 +118,8 @@ class DiscoveryFairness(unittest.TestCase):
     def test_slow_inputs_are_retried_without_pinning_the_next_source(self):
         self.source_ids = ['one', 'two']
         self.config['discover_batch'] = 2
+        # 预算显式给 121s：默认预算已抬到 180s，慢项推进 121s 不再触发「到点收尾」。
+        self.config['batch_seconds'] = 121
         case = self
         class Slow:
             async def check_many_async(self, *args):

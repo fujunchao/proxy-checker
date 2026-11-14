@@ -257,6 +257,7 @@ class CoordinatorRegression(unittest.TestCase):
         self.assertTrue(observed.is_set())
         self.assertEqual(summary["repo_added"], 1)
         self.assertEqual(summary["incomplete_count"], 1)
+        self.assertFalse(summary["budget_exceeded"], "自然结束的批次不能被标成预算截断")
 
     def test_selection_refresh_skip_fairness_and_large_backlog(self):
         from maintenance import choose_batch
@@ -376,9 +377,53 @@ class CoordinatorRegression(unittest.TestCase):
                                  context, threading.Event(), server.make_observation, clock=lambda: now[0], wait=tick)
         result, _ = asyncio.run(batch.run([item(1)["proxy"], item(2)["proxy"]]))
         self.assertEqual(result["incomplete_count"], 1)
+        self.assertTrue(result["budget_exceeded"], "到点收尾必须标记为预算截断，而不是人工停止")
+        self.assertGreaterEqual(result["elapsed_seconds"], 3)
         self.assertEqual(result["repo_removed"], 0)
         self.assertEqual(len(store.snapshot()["items"]), 2)
         self.assertEqual(store.snapshot()["items"][0]["last_ok"], 2000)
+
+    def test_batch_budget_floor_covers_single_proxy_timeout(self):
+        # A：预算低于单条硬超时，批次必然被「到点收尾」截断（生产近 24h 71% 的发现批如此）。
+        self.assertEqual(server.min_batch_seconds(1), 120)
+        self.assertEqual(server.min_batch_seconds(2), 180)
+        self.assertEqual(server.min_batch_seconds(3), 240)
+        self.assertEqual(server.min_batch_seconds(), server.min_batch_seconds(server.CHECK_ROUNDS))
+        self.assertEqual(server.normalize_auto_config({})["batch_seconds"], server.min_batch_seconds())
+        # 旧配置 120s 在归一时抬到下限；显式更大值保留；上限仍是 600。
+        self.assertEqual(server.normalize_auto_config({"batch_seconds": 120})["batch_seconds"],
+                         server.min_batch_seconds())
+        self.assertEqual(server.normalize_auto_config({"batch_seconds": 300})["batch_seconds"], 300)
+        self.assertEqual(server.normalize_auto_config({"batch_seconds": 9999})["batch_seconds"], 600)
+
+    def test_budget_truncation_reported_in_runtime_and_summary(self):
+        token = "budget_flagged"
+        cfg = self.config(discover_batch=2, batch_seconds=3, publish_count=1)
+        class Engine:
+            async def check_many_async(self, proxies, stop_event, rounds, max_concurrent, on_result, target_profile):
+                await on_result({**item(1), "proxy": proxies[0], "original": proxies[0],
+                                 "terminal_complete": True, "started_at": 1000, "completed_at": 2000})
+                await asyncio.Event().wait()
+        def source(*_):
+            return [item(1)["proxy"], item(2)["proxy"]], "synthetic"
+        runtime = {"run_id": "budget_flagged_run", "stop": threading.Event(), "results": [], "counts": [0, 0, 0]}
+        server.auto_runtime[token] = runtime
+        ticks = [0]
+        def timer_clock():
+            ticks[0] += 2
+            return float(ticks[0])
+        server.execute_maintenance_run(token, cfg, runtime, engine=Engine(), source=source,
+                                       clock=lambda: 5, timer_clock=timer_clock, source_ids=["synthetic"])
+        self.assertTrue(runtime["batch_truncated"])
+        self.assertEqual(runtime["batch_seconds"], 3)
+        self.assertEqual(runtime["incomplete_count"], 1)
+        self.assertGreater(server.repo_store(token).maintenance()["discover_machine_seconds"], 0,
+                           "机时累计要落到维护态，跨批重启后可继续对比")
+        summary = server.build_auto_summary(runtime, "completed")
+        self.assertTrue(summary["batch_truncated"], "运行日志/历史摘要也要带截断标记")
+        self.assertEqual(summary["batch_seconds"], 3)
+        self.assertEqual(summary["incomplete_count"], 1)
+        server.auto_runtime.pop(token)
 
     def test_manual_cancel_keeps_committed_and_discards_buffer(self):
         from maintenance import IncrementalBatch, FairBudget

@@ -290,5 +290,30 @@ for (const readFirst of [true, false]) {
   assert.equal(ow.loadRepo().length, 2, '成功响应不能丢失新增代理');
 }
 
+// D：批次预算截断要能一眼看出「本批没跑完」不是崩了，并把发现/复测机时摊开。
+// 前面用例留下的 #autoProgress（弹窗状态区）会抢到 getElementById，先摘干净再断言。
+Array.from(w.document.querySelectorAll('#autoProgress')).forEach(n => n.remove());
+const budgetDom = w.document.createElement('div');
+budgetDom.id = 'autoProgress';
+w.document.body.appendChild(budgetDom);
+w.renderAutoProgress({config: {maintenance_mode: 'continuous', target_profile: 'zai'},
+  state: {running: true, work_type: 'discover', done: 116, total: 200, incomplete_count: 84,
+    batch_seconds: 180, batch_truncated: true, discovery_pending: 14805, pending_count: 0,
+    discover_machine_seconds: 7200, refresh_machine_seconds: 3600}});
+assert.match(budgetDom.textContent, /上批预算 180 秒用尽/);
+assert.match(budgetDom.textContent, /完成 116\/200/);
+assert.match(budgetDom.textContent, /剩余 84 条未完成/);
+assert.match(budgetDom.textContent, /机时（升级后累计）: 发现 2 小时 · 复测 1 小时 · 发现占 67%/);
+w.renderAutoProgress({config: {maintenance_mode: 'continuous'},
+  state: {running: true, work_type: 'refresh', done: 3, total: 3, incomplete_count: 0,
+    batch_seconds: 180, batch_truncated: false}});
+assert.doesNotMatch(budgetDom.textContent, /上批预算/);
+// 历史批次也要标出截断，避免「done 116/200」看起来像中途崩了。
+w.renderAutoProgress({config: {maintenance_mode: 'continuous'},
+  state: {history: [{finished_at: 1794622800, work_type: 'discover', done: 116, total: 200,
+    valid_count: 14, batch_truncated: true}]}});
+assert.match(budgetDom.textContent, /预算截断/);
+budgetDom.remove();
+
 dom.window.close();
 console.log('maintenance frontend ok');
