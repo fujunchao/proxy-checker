@@ -39,4 +39,10 @@
 
 ## 发布验证记录
 
-- 待补：提交 SHA、CI 运行链接、镜像摘要与部署结果。
+- 发布源码提交：`5cde9a6deedc8ff29f429d9e5dcfc1def970c714`；标签 `v6.7.6`（annotated `7977645d67867de55c6a8001b9e204d4002fada0`）。
+- [发布工作流（docker）](https://github.com/fujunchao/proxy-checker/actions/runs/43550957874)：通过——tests（含 Docker 冒烟 isolated/fixed）与 `linux/amd64` + `linux/arm64` 构建、推送 GHCR 全部成功。
+- [main 分支测试](https://github.com/fujunchao/proxy-checker/actions/runs/43550954058)：通过。
+- 镜像：`ghcr.io/fujunchao/proxy-checker@sha256:18c09fde7fc80128f6ea0ed030362c4741c5902303b280d4bc492130b07f589f`，`v6.7.6` 与 `latest` 为同一摘要。
+- 部署（2026-11-14 11:23:23 CST，1Panel compose 目录 `/opt/1panel/apps/local/proxy-checker`）：部署前备份 `backup_pre_676_20261114_112230.tar.gz`；容器 healthy；配置归一后 `config.batch_seconds=180`。
+- 部署后前 4 个批次（11:25–11:31）全部 `truncated=False`：发现批 200/200、200/200，复测批 12/12、11/11；运行态已写入 `batch_seconds=180`、`incomplete_count=0` 与机时累计（发现 124 秒 / 复测 92 秒起步）。
+- 观察项：`maintenance end` 的 `truncated=True` 比例（目标 <10%）、发现批墙钟（典型 140–180 秒）、页面「机时占比」。
